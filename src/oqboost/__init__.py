@@ -24,7 +24,7 @@ def load_model(path: str) -> OQBoostClassifier | OQBoostRegressor:
     return joblib.load(path)
 
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 __all__ = [
     "OQBoostClassifier",
     "OQBoostRegressor",

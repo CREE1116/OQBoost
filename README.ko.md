@@ -1,8 +1,8 @@
 # OQBoost
 
-**유전적 사영 진화를 기반으로 한 경사 부스팅 사선 결정 트리 (Gradient-boosted oblique decision trees with hereditary projection evolution)**
+**직접 경사-공분산 스캔을 기반으로 한 경사 부스팅 사선 결정 트리 (Gradient-boosted oblique decision trees with deterministic Gradient-Covariance Scan)**
 
-OQBoost는 기존의 축 정렬 분기(axis-aligned splits) 대신 그라디언트(gradient)에 의해 정렬되는 사선 하이퍼플레인(oblique hyperplanes) 분기를 수행합니다. 이 분기 방향들은 부모 노드로부터 상속 및 변이되는 유전적 파이프라인을 거치며, 값비싼 수치 최적화 없이도 데이터의 고유한 기하학적 구조를 효과적으로 캡처합니다.
+OQBoost는 기존의 축 정렬 분기(axis-aligned splits) 대신 그라디언트(gradient)에 의해 정렬되는 사선 하이퍼플레인(oblique hyperplanes) 분기를 수행합니다. 무작위 사영이나 유전적 변이 없이 결정론적인 직접 경사-공분산 스캔(DGCS) 방식을 통해 닫힌 형식(closed-form)으로 최적의 분기 방향을 직접 도출하며, 값비싼 수치 최적화 없이도 데이터의 고유한 기하학적 구조를 효과적으로 캡처합니다.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/cree1116/oqboost/main/docs/diverse_boundaries.png" alt="OQBoost 결정 경계" width="800">
@@ -182,21 +182,41 @@ clf2 = load_model("model.joblib")
 
 ## 알고리즘 개요 (Algorithm)
 
-OQBoost는 다음과 같은 3단계 유전적 사영 진화 파이프라인을 가동합니다.
+OQBoost는 **DGCS (Direct Gradient-Covariance Scan, 직접 경사-공분산 스캔)** 알고리즘을 사용하여 수치 최적화나 무작위 확률 사영, 유전적 알고리즘(변이/상속) 없이 결정론적(Deterministic)으로 최적의 사선 분기 방향을 계산합니다.
 
-**1단계 — GG-SRP (그라디언트 유도형 희소 무작위 사영)**  
-각 노드에서 샘플 오차 정보를 담은 SIS 그라디언트 중요도 스코어에 비례하여 피처들을 서브 공간에 샘플링합니다. 그 후 각 피처의 가중치 부호를 가장 가파른 오차 경사하강 방향과 일치하도록 정렬합니다. 이 모든 연산은 그람 행렬 구축이나 연립 방정식 계산 없이 $O(D)$의 선형 복잡도로 수행됩니다.
+### DGCS (Direct Gradient-Covariance Scan)
+노드 분기를 수행할 때, 다음의 2차 분기 이득 프록시(split-gain proxy) $J(w)$를 최대화하는 사영 방향 $w$를 찾는 것이 목표입니다:
+$$J(w) = \frac{(w^T G)^2}{w^T H w + \lambda \|w\|^2}$$
+여기서 $G[d] = \sum_{i} x_{id} g_i$는 그라디언트-피처 간의 공분산(gradient-feature covariance)입니다.
+헤시안이 고르게 분포한다는 가정($H \approx \sigma I$) 아래, 수식상의 최대점은 다음과 같은 닫힌 형식(closed-form) 솔루션을 가집니다:
+$$w^* \propto G$$
+OQBoost는 이 닫힌 형식 해를 직접 계산함으로써 복잡한 선형 시스템을 풀거나 수치 최적화 루프를 돌지 않고도 $O(N \cdot d_{\text{sub}})$ 복잡도만으로 최적의 사선 분기 방향을 바로 도출합니다.
 
-**2단계 — 부모 방향 상속 (Parent Weight Inheritance)**  
-자식 노드는 부모 노드의 우수한 스플릿 방향 가중치를 물려받아 아래의 두 가지 유전적 변이를 거쳐 후보군으로 추가합니다.
-- *Strategy A (축 유지 변이)*: 결정 경계선을 미세하게 비틀어 탐색 각도를 미세 조정합니다 (±10%).
-- *Strategy B (상관 축 확장 변이)*: 부모 노드의 피처 세트에 신규 피처를 확장 병합합니다.
+### 후보군 (Candidate Families)
+데이터의 희소성(Sparsity) 대응 및 다중 클래스 지원을 위해 DGCS는 다음의 사영 방향 후보들을 스캔하여 가장 우수한 분기를 선택합니다:
+- **`g` (전체 공분산, Full Covariance)**: 공분산 벡터를 그대로 사용한 방향 $w = G$ (정규화 적용).
+- **`s` (부호 공분산, Sign Covariance)**: 부호 정보만을 남긴 희소 방향 $w = \text{sign}(G)$로 강건하고 일반화된 경계를 캡처합니다.
+- **`2` / `4` (희소 공분산, Sparse Covariance)**: 공분산 크기 기준 상위 2개 또는 4개의 피처만 사영에 참여시켜 해석 가능성이 높은 희소 사선 분기를 형성합니다.
+- **`c` (클래스별 공분산, Per-class Covariance)**: 다중 클래스 환경에서 각 클래스의 개별 그라디언트를 바탕으로 전체 공분산 및 상위 4개 희소 공분산 벡터를 각각 계산하여 모든 클래스의 분별 성능을 보장합니다.
 
-**3단계 — 글로벌-로컬 크로스오버 + 깊이 감쇠**  
-- *Strategy C (크로스오버)*: 이전 라운드에서 우수했던 상위 32개 사영 축을 담은 전역 버퍼 `dir_cache`와 부모 노드의 방향을 무작위 비율로 섞어 하이브리드 후보를 생산합니다.
-- *깊이 감쇠 (Depth Decay)*: 상위 노드에서는 탐색(exploration)이 중요하지만 하위 노드에서는 오버핏을 억제해야 하므로, 노드 깊이에 반비례하여 변이 노이즈 강도를 $1/\sqrt{1 + d}$ 로 감쇠시킵니다.
+### 방향 캐시 (Direction Cache)
+이전 트리들에서 분기를 획득하여 성능이 증명된 최적 방향들은 전역 링 버퍼인 `dir_cache`에 저장됩니다. 대형 노드($N \ge 512$)들은 로컬 경사-공분산 최적점 외에 이 캐시된 전역 우수 방향들을 추가 후보로 스캔하여 학습 효율을 극대화합니다.
 
 수리적 유도 과정은 [`docs/algorithm.md`](docs/algorithm.md)에서, 상세 연구 및 실험 로그는 [`docs/THEORY.md`](docs/THEORY.md)에서 확인하실 수 있습니다.
+
+---
+
+## 성능 및 메모리 최적화 (Performance & Memory Optimizations)
+
+OQBoost는 대규모 정형 데이터셋의 고속 학습 및 추론을 지원하도록 백엔드와 래퍼 계층에 대대적인 저수준 최적화가 적용되었습니다.
+
+* **메모리 사전 할당 구조 (Zero-Allocation Oblique Search)**: 사선 방향 벡터 및 임시 작업 버퍼(`dirs_buf`, `samp_e_buf`, `scratch_cg_s` 등)를 컨텍스트(`OQBoostCtx`) 생성 시점에 미리 할당합니다. 트리가 성장하는 루프 안에서 발생하는 잦은 힙(Heap) 메모리 동적 할당/해제 오버헤드를 근본적으로 제거했습니다.
+* **스택 메모리 기반 다중 클래스 연산**: 스택에 할당된 컴팩트 버퍼(`thread_Gc_stack` 등, 최대 64개 클래스)를 사용하여 다중 클래스의 그라디언트와 NaN-routing 통계를 수집합니다. 이를 통해 멀티스레드 OpenMP 축 스캔 시 힙 메모리 접근 및 경합을 피합니다.
+* **이진 클래스 고속 패스 및 Softmax 캐싱**: 이진 분류(`K=2`)를 위한 전용 고속 연산 패스를 갖추어 이중 지수 함수(`std::exp`) 연산을 방지합니다. 다중 클래스 연산 시 지수 함수 계산 결과를 스택 버퍼(`p_buf[64]`)에 캐싱하여 고비용 초월 함수 연산을 최소화했습니다.
+* **순수 수치형 데이터 제로-카피 추론**: 범주형 변수가 없는 순수 수치형 데이터셋 예측 시(`D_num == D`), 임시 데이터 복사 과정 없이 입력 메모리 버퍼를 그대로 사용하여 불필요한 동적 메모리 할당 및 복사를 생략합니다.
+* **Python 계층 내 In-place 연산 적용**: 그라디언트/헤시안 연산 및 Huber 손실 계산 시 임시 넘파이 배열을 생성하지 않고 사전 할당된 버퍼에 복사 및 덮어쓰기 연산(`out=`, `np.clip` 등)을 적용해 메모리 할당 오버헤드를 억제했습니다.
+* **범주형 피처 캐시**: 범주형 피처의 인덱스 확인 연산을 Python 클래스 수준에서 캐싱(`_cat_idx_cache_`)하여 라운드마다 반복되는 $O(D)$ 루프 검색을 생략했습니다.
+* **실시간 메모리 회수**: 노드 분기가 끝나는 즉시 부모 노드가 점유하던 샘플 인덱스 목록(`node_samp`)을 비우고 메모리를 즉시 반환(`shrink_to_fit`)합니다. 이를 통해 전체 탐색 과정의 피크 메모리 사용량을 $O(N \times \text{current\_depth})$ 수준으로 타이트하게 억제합니다.
 
 ---
 
@@ -223,10 +243,10 @@ OQBoost는 다음과 같은 3단계 유전적 사영 진화 파이프라인을 �
 | `cat_features` | None | 범주형 피처 컬럼 명칭(DataFrame) 또는 컬럼 인덱스 목록 |
 | `class_weight` | None | `"balanced"` 설정 시 사전 확률 보정 의사결정 규칙 적용 (확률값은 보정 유지) |
 | `prior_alpha` | 0.5 | balanced 보정 강도: 0 = 순수 argmax, 1 = 완전 사전확률 보정 |
-| `inherited_rp_ratio` | 1.0 | 상속 및 캐시 패밀리가 스캔 후보 풀에서 차지하는 비율 |
-| `mutation_rate` | 0.1 | Strategy A 축 변이의 노이즈 강도 파라미터 |
-| `mutation_strength` | 0.5 | Strategy B 상관 피처 차용 시의 기본 가중치 |
-| `pobs` | False | Haar-orthogonal 기반의 무작위 직교 블록 후보 주입 여부 |
+| `inherited_rp_ratio` | 1.0 | 사용되지 않음 (Legacy, v0.1.8부터 폐지) |
+| `mutation_rate` | 0.1 | 사용되지 않음 (Legacy, v0.1.8부터 폐지) |
+| `mutation_strength` | 0.5 | 사용되지 않음 (Legacy, v0.1.8부터 폐지) |
+| `pobs` | False | 사용되지 않음 (Legacy, v0.1.8부터 폐지) |
 | `random_state` | None | 난수 고정 시드 |
 | `verbose` | False | 학습 과정 모니터링 출력 여부 |
 

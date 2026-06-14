@@ -1,8 +1,8 @@
 # OQBoost
 
-**Gradient-boosted oblique decision trees with hereditary projection evolution.**
+**Gradient-boosted oblique decision trees with deterministic Gradient-Covariance Scan.**
 
-OQBoost replaces axis-aligned splits with gradient-guided oblique hyperplanes that are inherited and mutated from parent nodes — exploiting the geometric structure of the data without expensive numerical optimization.
+OQBoost replaces axis-aligned splits with gradient-guided oblique hyperplanes computed directly via a deterministic Gradient-Covariance Scan (DGCS) — exploiting the geometric structure of the data without expensive numerical optimization or random search.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/cree1116/oqboost/main/docs/diverse_boundaries.png" alt="OQBoost Decision Boundaries" width="800">
@@ -182,21 +182,41 @@ All benchmarks: 80/20 train-test split, 3 repetitions, mean ± standard deviatio
 
 ## Algorithm
 
-OQBoost uses three-stage hereditary projection evolution:
+OQBoost uses **DGCS (Direct Gradient-Covariance Scan)** to construct oblique split directions deterministically, eliminating the need for slow, random-search stochastic projections or genetic mutations.
 
-**Stage 1 — GG-SRP (Gradient-Guided Sparse Random Projection)**  
-Features are sampled with probability proportional to SIS gradient-importance scores. Each selected feature gets a weight sign aligned with the steepest gradient descent direction. No Gram matrix, no linear system — $O(D)$ per node.
+### DGCS (Direct Gradient-Covariance Scan)
+For a node split, we aim to find a projection direction $w$ that maximizes the second-order split-gain proxy:
+$$J(w) = \frac{(w^T G)^2}{w^T H w + \lambda \|w\|^2}$$
+where $G[d] = \sum_{i} x_{id} g_i$ is the gradient-feature covariance.
+Under the assumption of homoscedasticity ($H \approx \sigma I$), the mathematical maximizer is the closed form:
+$$w^* \propto G$$
+This closed-form solution allows OQBoost to compute the optimal oblique direction directly in $O(N \cdot d_{\text{sub}})$ without solving a costly linear system or running iterative optimization.
 
-**Stage 2 — Parent Weight Inheritance**  
-Child nodes inherit their parent's split direction and apply two mutation strategies:
-- *Strategy A:* axis-maintaining noise (tilt the boundary by ±10%)
-- *Strategy B:* new-axis borrowing (add a high-correlation feature not in the parent's support)
+### Candidate Families
+To handle different sparsity requirements and multiclass scenarios, DGCS evaluates a small pool of candidate projection directions:
+- **`g` (Full Covariance)**: The raw covariance vector $w = G$ (normalized).
+- **`s` (Sign Covariance)**: A simplified sign-only vector $w = \text{sign}(G)$ for robust, axis-leaning projections.
+- **`2` / `4` (Sparse Covariance)**: Restricts the projection to the top-2 or top-4 features sorted by gradient covariance magnitude, producing sparse, highly interpretable oblique splits.
+- **`c` (Per-class Covariance)**: In multiclass settings, computes full and top-4 sparse covariance vectors for each class gradient, ensuring representation for all target classes.
 
-**Stage 3 — Global-Local Crossover + Depth Decay**  
-- *Strategy C:* random blend of the current parent direction with a globally top-performing direction from the ring buffer (last 32 rounds)
-- *Depth decay:* mutation strength decreases as $1/\sqrt{1 + d}$ — wide exploration at shallow depth, fine-tuning at deep nodes
+### Direction Cache
+Directions that win splits in previous trees are stored in a global ring buffer `dir_cache`. Large nodes ($N \ge 512$) evaluate these cached directions to capture globally top-performing patterns across the ensemble, complementing the local gradient-covariance optimum.
 
 See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation and [`docs/THEORY.md`](docs/THEORY.md) for theoretical insights and experiment logs.
+
+---
+
+## Performance & Memory Optimizations
+
+OQBoost is designed for high-throughput training and inference on large-scale tabular datasets. The core C++ engine and Python wrappers include several low-level optimizations:
+
+* **Zero-Allocation Oblique Search**: Pre-allocates all oblique directions, scratch arrays, and candidate buffers (e.g., `dirs_buf`, `samp_e_buf`, `scratch_cg_s`) per binning context. This avoids expensive heap malloc/free cycles in the hot leaf-growth loop.
+* **Stack-Allocated Multiclass Buffers**: Uses fast stack-allocated buffers for multiclass gradients and NaN-routing states up to `K_MAX_STACK=64` classes, bypassing heap memory traffic during multi-threaded OpenMP scans.
+* **Logistic Symmetry & Softmax Cache**: Dedicated fast path for `K=2` (binary logloss) to avoid dual exponential evaluations. For `K > 2` multiclass, exp values are cached in a stack buffer to minimize costly transcendental functions.
+* **Zero-Copy Purely Numerical Routing**: In `gf_predict`, if the features are purely numerical, the routing maps directly to input pointers, bypassing intermediate data copy/imputation allocation entirely.
+* **In-place Python Gradients**: Gradient, Hessian, and Huber loss updates are executed via in-place NumPy functions (`out=`, `np.clip`) to prevent temporary array allocation overhead.
+* **Active Categorical Cache**: Caches category index resolutions in Python (`_cat_idx_cache_`) to skip redundant $O(D)$ checks on every boosting round.
+* **Active Memory Capping**: Rehearses and clears node index lists (`node_samp`) immediately after splitting, capping peak memory to $O(N \times \text{current\_depth})$ instead of holding indices for all tree levels.
 
 ---
 
@@ -223,10 +243,10 @@ See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation and [`docs/
 | `cat_features` | None | Categorical column names or indices |
 | `class_weight` | None | `"balanced"` applies a prior-corrected decision rule (probabilities stay calibrated) |
 | `prior_alpha` | 0.5 | Strength of the balanced correction: 0 = plain argmax, 1 = full prior correction |
-| `inherited_rp_ratio` | 1.0 | Fraction of candidates from inheritance + cache |
-| `mutation_rate` | 0.1 | Base noise scale for axis mutations |
-| `mutation_strength` | 0.5 | Base weight for new-axis borrowing |
-| `pobs` | False | Inject Haar-orthogonal POBS candidates into every node's tournament |
+| `inherited_rp_ratio` | 1.0 | Unused (Legacy, deprecated since v0.1.8) |
+| `mutation_rate` | 0.1 | Unused (Legacy, deprecated since v0.1.8) |
+| `mutation_strength` | 0.5 | Unused (Legacy, deprecated since v0.1.8) |
+| `pobs` | False | Unused (Legacy, deprecated since v0.1.8) |
 | `random_state` | None | Seed |
 | `verbose` | False | Print per-round metrics |
 

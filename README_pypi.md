@@ -1,8 +1,8 @@
 # OQBoost
 
-**High-performance gradient-boosted oblique decision trees with hereditary projection evolution.**
+**High-performance gradient-boosted oblique decision trees with deterministic Gradient-Covariance Scan.**
 
-OQBoost replaces standard axis-aligned splits with gradient-guided oblique hyperplanes that are inherited and mutated from parent nodes. It builds oblique splits without expensive numerical optimization, yielding superior boundaries on complex tabular datasets.
+OQBoost replaces standard axis-aligned splits with gradient-guided oblique hyperplanes computed directly via a deterministic Gradient-Covariance Scan (DGCS). It builds oblique splits without expensive numerical optimization or random search, yielding superior boundaries on complex tabular datasets.
 
 ---
 
@@ -159,6 +159,18 @@ clf.save("model.joblib")
 # Load model (automatically loads Classifier or Regressor)
 model = load_model("model.joblib")
 ```
+
+## Performance & Memory Optimizations
+
+OQBoost is designed for high-throughput training and inference on large-scale tabular datasets. The core C++ engine and Python wrappers include several low-level optimizations:
+
+* **Zero-Allocation Oblique Search**: Pre-allocates all oblique directions, scratch arrays, and candidate buffers (e.g., `dirs_buf`, `samp_e_buf`, `scratch_cg_s`) per binning context. This avoids expensive heap malloc/free cycles in the hot leaf-growth loop.
+* **Stack-Allocated Multiclass Buffers**: Uses fast stack-allocated buffers for multiclass gradients and NaN-routing states up to `K_MAX_STACK=64` classes, bypassing heap memory traffic during multi-threaded OpenMP scans.
+* **Logistic Symmetry & Softmax Cache**: Dedicated fast path for `K=2` (binary logloss) to avoid dual exponential evaluations. For `K > 2` multiclass, exp values are cached in a stack buffer to minimize costly transcendental functions.
+* **Zero-Copy Purely Numerical Routing**: In `gf_predict`, if the features are purely numerical, the routing maps directly to input pointers, bypassing intermediate data copy/imputation allocation entirely.
+* **In-place Python Gradients**: Gradient, Hessian, and Huber loss updates are executed via in-place NumPy functions (`out=`, `np.clip`) to prevent temporary array allocation overhead.
+* **Active Categorical Cache**: Caches category index resolutions in Python (`_cat_idx_cache_`) to skip redundant $O(D)$ checks on every boosting round.
+* **Active Memory Capping**: Rehearses and clears node index lists (`node_samp`) immediately after splitting, capping peak memory to $O(N \times \text{current\_depth})$ instead of holding indices for all tree levels.
 
 ---
 

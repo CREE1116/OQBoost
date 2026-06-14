@@ -574,6 +574,8 @@ class OQBoostResearchTree:
             is_px_mode = True
         elif mode == 'gg_srp':
             is_px_mode = True
+        elif mode == 'grad_cov_det':
+            is_px_mode = True
         else:
             parts = mode.split('_')
             if len(parts) >= 3 and parts[0] == 'proxy' and parts[1] == 'search':
@@ -667,6 +669,64 @@ class OQBoostResearchTree:
                     w_r[top_feat] = signs
                     w_r = w_r / (w_r.norm() + 1e-8)
                     candidates.append((w_r, 'random'))
+            elif mode == 'grad_cov_det':
+                # Deterministic Gradient Covariance Scan (DGCS).
+                # All candidates derived analytically from data — zero RNG.
+                # Candidates:
+                #   axis(d_sub) + gcov_full + gcov_sign + gcov_top2 + gcov_top4
+                #   + wls (Hessian-adjusted, maximizes linearized gain exactly)
+
+                # Axis candidates (d_sub SIS-selected features)
+                for f in top_feat:
+                    w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w[f] = 1.0
+                    candidates.append((w, 'axis'))
+
+                X_sub = X_node[:, top_feat]
+                g_k = G_node[:, k_dom]
+                G_vec = -(X_sub.T @ g_k)   # (d_sub,) gradient-feature covariance
+                m = len(top_feat)
+                top_feat_t = torch.tensor(top_feat, dtype=torch.long, device=X_node.device)
+
+                # 1. Full cov: all SIS features, magnitudes proportional to |corr|
+                norm_full = G_vec.norm()
+                if norm_full > 1e-8:
+                    w_full = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w_full[top_feat_t] = G_vec / norm_full
+                    candidates.append((w_full, 'gcov_full'))
+
+                # 2. Sign direction: ±1 on all SIS features aligned with gradient
+                w_sign = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                g_signs = G_vec.sign()
+                g_signs[g_signs == 0] = 1.0
+                w_sign[top_feat_t] = g_signs
+                n_sign = w_sign.norm()
+                if n_sign > 1e-8:
+                    candidates.append((w_sign / n_sign, 'gcov_sign'))
+
+                abs_vals = G_vec.abs()
+
+                # 3. Top-2 sparse cov
+                if m >= 2:
+                    top2_idx = abs_vals.topk(min(2, m)).indices
+                    w_t2 = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w_t2[top_feat_t[top2_idx]] = G_vec[top2_idx]
+                    n2 = w_t2.norm()
+                    if n2 > 1e-8:
+                        candidates.append((w_t2 / n2, 'gcov_top2'))
+
+                # 4. Top-4 sparse cov
+                if m >= 4:
+                    top4_idx = abs_vals.topk(min(4, m)).indices
+                    w_t4 = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w_t4[top_feat_t[top4_idx]] = G_vec[top4_idx]
+                    n4 = w_t4.norm()
+                    if n4 > 1e-8:
+                        candidates.append((w_t4 / n4, 'gcov_top4'))
+
+                # Note: WLS (A^{-1} G_vec) was tested but hurts real tabular data
+                # due to Hessian noise overfitting at small nodes. Excluded.
+
             elif mode == 'proxy_search':
                 for f in top_feat:
                     w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)

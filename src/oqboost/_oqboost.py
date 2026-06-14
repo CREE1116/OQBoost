@@ -239,10 +239,6 @@ class OQBoostTree:
         H:      np.ndarray,
         D_num:  int | None = None,
         subset: np.ndarray | None = None,
-        inherited_rp_ratio: float = 1.0,
-        mutation_rate: float = 0.1,
-        mutation_strength: float = 0.5,
-        pobs: bool = True,
     ) -> np.ndarray:
         """One-shot build (creates and frees a binning context internally).
 
@@ -267,10 +263,6 @@ class OQBoostTree:
         try:
             tree, out_pred = ctx.build(
                 G, H, subset, self.max_depth, self.reg_lambda,
-                inherited_rp_ratio=inherited_rp_ratio,
-                mutation_rate=mutation_rate,
-                mutation_strength=mutation_strength,
-                pobs=pobs,
             )
         finally:
             ctx.close()
@@ -418,11 +410,7 @@ class OQBoostContext:
         sub: np.ndarray,
         max_depth: int,
         reg_lambda: float,
-        inherited_rp_ratio: float = 1.0,
-        mutation_rate: float = 0.1,
-        mutation_strength: float = 0.5,
         seed: int = 42,
-        pobs: bool = True,
         reg_alpha: float = 0.0,
         gamma: float = 0.0,
         min_child_weight: float = 1.0,
@@ -438,15 +426,18 @@ class OQBoostContext:
         K = G.shape[1]
         out_pred = np.zeros((self.N, K), dtype=np.float32)
         lib = _get_oqboost_lib()
+        # The DGCS engine ignores inherited_rp_ratio / mutation_rate /
+        # mutation_strength / pobs (the old stochastic candidate families were
+        # removed); pass zeros to keep the gf_build C ABI unchanged.
         handle = lib.gf_build(
             self._handle, None, _fptr(G), _fptr(H), K,
             _iptr(sub), len(sub), max_depth,
             ctypes.c_float(reg_lambda),
-            ctypes.c_float(inherited_rp_ratio),
-            ctypes.c_float(mutation_rate),
-            ctypes.c_float(mutation_strength),
+            ctypes.c_float(0.0),   # inherited_rp_ratio (unused)
+            ctypes.c_float(0.0),   # mutation_rate (unused)
+            ctypes.c_float(0.0),   # mutation_strength (unused)
             ctypes.c_int(seed),
-            ctypes.c_int(1 if pobs else 0),
+            ctypes.c_int(0),       # pobs (unused)
             ctypes.c_float(reg_alpha),
             ctypes.c_float(gamma),
             ctypes.c_float(min_child_weight),

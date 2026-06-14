@@ -89,20 +89,24 @@ struct OQBoostCtx {
   std::vector<float> Pj_workspace; // Size: n_dirs * ne
 
   void cache_direction(const std::vector<float>& w) {
-    for (int d = D_num; d < D; d++)
-      if (w[d] != 0.0f) return;  // touches a cat dim — meaning is per-round
+    // Cache only the NUMERIC subspace of a winning direction. Categorical dims
+    // are per-round gradient-rank encoded, so a cat weight means something
+    // different in the next tree — but the numeric geometry is stable across
+    // trees. Projecting cat dims out (instead of skipping any cat-touching
+    // direction entirely) lets categorical-heavy datasets like adult still
+    // reuse cross-tree numeric directions — the cache was empty for them before.
     float nw = 0.0f;
-    for (int d = 0; d < D; d++) nw += w[d] * w[d];
-    if (nw < 1e-12f) return;
+    for (int d = 0; d < D_num; d++) nw += w[d] * w[d];
+    if (nw < 1e-12f) return;  // purely categorical direction — nothing stable
     float norm = std::sqrt(nw);
+    float inv_norm = 1.0f / norm;
+    std::vector<float> wn(D, 0.0f);
+    for (int d = 0; d < D_num; d++) wn[d] = w[d] * inv_norm;  // cat dims stay 0
     for (const auto& c : dir_cache) {
       float dot = 0.0f;
-      for (int d = 0; d < D; d++) dot += c[d] * w[d];
-      if (std::abs(dot) / norm > 0.95f) return;  // redundant
+      for (int d = 0; d < D_num; d++) dot += c[d] * wn[d];
+      if (std::abs(dot) > 0.95f) return;  // redundant (both unit on numeric)
     }
-    std::vector<float> wn(w.begin(), w.begin() + D);
-    float inv_norm = 1.0f / norm;
-    for (int d = 0; d < D; d++) wn[d] *= inv_norm;
     if ((int)dir_cache.size() < DIR_CACHE_MAX) {
       dir_cache.push_back(std::move(wn));
     } else {
@@ -1007,239 +1011,162 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     int& dirs_n = ctx->dirs_n;
     dirs_n = 0;
     float* GF_RESTRICT dirs_flat = ctx->dirs_buf.data();
-    std::mt19937 rng(seed + t);
 
     // OQB_GAIN_LOG (research instrumentation, THEORY.md §1 open task):
     // when set to a file path, append one CSV line per evaluated candidate:
     //   node_seq,depth,ns,family,gain
-    // family ∈ {x axis, a/b/c inherited strategies, p pobs block, k cache}.
+    // family ∈ {x axis, g/s/2/4 DGCS dirs, c per-class DGCS}.
     // Default off — production behavior untouched.
     static FILE* gain_log = [] {
       const char* p = std::getenv("OQB_GAIN_LOG");
       return p ? std::fopen(p, "a") : (FILE*)nullptr;
     }();
     std::vector<char> fam;
+    (void)seed; (void)pobs; (void)inherited_rp_ratio;
+    (void)mutation_rate; (void)mutation_strength;
 
-    auto& prob = ctx->scratch_prob;
-    for (int d = 0; d < D; d++) {
-                    prob[d] = feat_mask[d] ? (fscore[d] + 1e-6f) : 0.0f;
-    }
-    std::discrete_distribution<int> feat_dist(prob.begin(), prob.end());
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-
-    auto fill_pobs = [&](int count) {
-      if (count <= 0) return;
-      int m = (int)std::lround(std::sqrt((float)D));
-      m = std::max(2, std::min({m, D_SUB_MAX, D}));
-      std::normal_distribution<float> gauss(0.0f, 1.0f);
-      int target = dirs_n + count;
-      while (dirs_n < target && dirs_n < OQBoostCtx::DIRS_MAX) {
-        std::vector<int> S;
-        std::vector<uint8_t> used(D, 0);
-        for (int attempt = 0; attempt < 50 * m && (int)S.size() < m;
-             attempt++) {
-          int f = feat_dist(rng);
-          if (!used[f]) {
-            used[f] = 1;
-            S.push_back(f);
+    // ── Deterministic Gradient Covariance Scan (DGCS) ────────────────────────
+    // Replaces ALL stochastic candidate families (GG-SRP random blocks, parent
+    // mutation A/B, cache crossover C). Those were heuristic stochastic searches
+    // for a good oblique direction — slow, RNG-dependent, no theory for WHY they
+    // land on good splits. DGCS computes the optimal oblique direction directly:
+    //
+    //   the second-order split-gain proxy is J(w) = (wᵀG)²/(wᵀHw+λ‖w‖²) with
+    //   G[d] = Σ_i x_id g_ik the gradient-feature covariance. Under H≈σI its
+    //   maximizer is the closed form  w* ∝ G  — no search. Ignoring the noisy
+    //   small-node Hessian is an implicit L2 regularizer (the exact WLS w=A⁻¹G
+    //   overfits local curvature; proxy_cov_study.md confirms cov beats WLS).
+    //
+    // Zero RNG, fully deterministic, O(N·d_sub). Validated in
+    // research/grad_cov_det_study.md (binary) — here extended with per-class
+    // directions so multiclass keeps a covariance candidate per class instead
+    // of only the dominant class. Families: 'g'/'s'/'2'/'4' = full/sign/top2/
+    // top4 covariance (binary); 'c' = per-class full+top4 (multiclass).
+    {
+      // top-D_SUB_MAX features by SIS score (fscore, dominant-class) — the
+      // research top_feat set. Directions live only on these coordinates.
+      int dn = 0;
+      int didx[D_SUB_MAX];
+      {
+        float thresh_score = 0.0f;
+        for (int d = 0; d < D; d++) {
+          if (!feat_mask[d] || fscore[d] <= 0.0f) continue;
+          if (dn < D_SUB_MAX) {
+            didx[dn++] = d;
+            if (dn == D_SUB_MAX) {
+              thresh_score = fscore[didx[0]];
+              for (int i = 1; i < dn; i++)
+                if (fscore[didx[i]] < thresh_score) thresh_score = fscore[didx[i]];
+            }
+          } else if (fscore[d] > thresh_score) {
+            int min_i = 0;
+            for (int i = 1; i < dn; i++)
+              if (fscore[didx[i]] < fscore[didx[min_i]]) min_i = i;
+            didx[min_i] = d;
+            thresh_score = fscore[didx[0]];
+            for (int i = 1; i < dn; i++)
+              if (fscore[didx[i]] < thresh_score) thresh_score = fscore[didx[i]];
           }
         }
-        int mm = (int)S.size();
-        if (mm < 2) break;
-        float B_flat[D_SUB_MAX * D_SUB_MAX];
-        for (int ii = 0; ii < mm * mm; ii++) B_flat[ii] = gauss(rng);
-        int emitted = 0;
-        for (int i = 0; i < mm && dirs_n < target && dirs_n < OQBoostCtx::DIRS_MAX; i++) {
-          for (int j = 0; j < i; j++) {
-            float dot = 0.0f;
-            for (int d2 = 0; d2 < mm; d2++) dot += B_flat[i*mm+d2] * B_flat[j*mm+d2];
-            for (int d2 = 0; d2 < mm; d2++) B_flat[i*mm+d2] -= dot * B_flat[j*mm+d2];
-          }
-          float n2 = 0.0f;
-          for (int d2 = 0; d2 < mm; d2++) n2 += B_flat[i*mm+d2] * B_flat[i*mm+d2];
-          if (n2 < 1e-12f) continue;
-          float inv = 1.0f / std::sqrt(n2);
-          float* GF_RESTRICT slot = dirs_flat + (size_t)dirs_n * D;
-          std::fill(slot, slot + D, 0.0f);
-          for (int d2 = 0; d2 < mm; d2++) slot[S[d2]] = B_flat[i*mm+d2] * inv;
-          dirs_n++;
-          if (gain_log) fam.push_back('p');
-          emitted++;
-        }
-        if (emitted == 0) break;
       }
-    };
 
-    bool has_parent = (t > 0);
-    int par = has_parent ? (t - 1) / 2 : -1;
-    SparseVec parent_nz;
-    parent_nz.size = 0;
-    if (has_parent) {
-      collect_nonzero_stack(tree->split_weights.data() + (size_t)par * D, D,
-                            parent_nz);
-    }
-
-    int depth_t = get_node_depth(t);
-    int pool_budget = (depth_t <= 2) ? 64 : 8;
-
-    int n_inherited = (int)std::round((float)pool_budget * inherited_rp_ratio);
-    if (n_inherited < 0) n_inherited = 0;
-    if (n_inherited > pool_budget) n_inherited = pool_budget;
-    int n_global = pool_budget - n_inherited;
-
-    int n_pobs_extra = pobs ? std::min(8, n_inherited) : 0;
-    n_inherited -= n_pobs_extra;
-
-    if (has_parent && parent_nz.size > 0) {
-      float local_mutation_rate =
-          mutation_rate / std::sqrt(1.0f + (float)depth_t);
-      float local_mutation_strength =
-          mutation_strength / (1.0f + (float)depth_t);
-
-      // Strategy-B candidate set (parent-excluded features) and its sampling
-      // distribution depend only on parent_nz and prob[], both fixed for this
-      // node. Build lazily once and reuse across draws — was rebuilt every
-      // draw: an O(D·|parent|) scan plus a discrete_distribution heap alloc.
-      // Construction consumes no rng, so the draw sequence is unchanged.
-      bool b_ready = false;
-      auto& candidate_feats = ctx->scratch_cand_feats;
-      std::discrete_distribution<int> new_feat_dist;
-
-      for (int r = 0; r < n_inherited; r++) {
-        float strategy_draw = dist(rng);
-        bool do_strategy_a = false;
-        bool do_strategy_b = false;
-        bool do_strategy_c = false;
-
-        if (!ctx->dir_cache.empty()) {
-          if (strategy_draw < 0.375f) {
-            do_strategy_a = (parent_nz.size > 1);
-            if (!do_strategy_a) do_strategy_b = true;
-          } else if (strategy_draw < 0.75f) {
-            do_strategy_b = true;
-          } else {
-            do_strategy_c = true;
-          }
-        } else {
-          if (strategy_draw < 0.5f) {
-            do_strategy_a = (parent_nz.size > 1);
-            if (!do_strategy_a) do_strategy_b = true;
-          } else {
-            do_strategy_b = true;
+      // Emit one normalized direction from a per-feature covariance vector
+      // cg_j (indexed by didx position). kfeat<=0 → use all dn features; else
+      // the top-kfeat by |cg_j| (sparse variant). use_sign → ±1 magnitudes.
+      auto emit_dir = [&](const float* cg_j, int kfeat, bool use_sign, char tag) {
+        if (dn < 1 || dirs_n >= OQBoostCtx::DIRS_MAX) return;
+        int order[D_SUB_MAX];
+        for (int i = 0; i < dn; i++) order[i] = i;
+        int uk = (kfeat <= 0 || kfeat >= dn) ? dn : kfeat;
+        if (uk < dn) {
+          // partial selection: top-uk positions by |cg_j|
+          for (int a = 0; a < uk; a++) {
+            int best = a;
+            for (int b = a + 1; b < dn; b++)
+              if (std::abs(cg_j[order[b]]) > std::abs(cg_j[order[best]])) best = b;
+            int tmp = order[a]; order[a] = order[best]; order[best] = tmp;
           }
         }
-
-        float* GF_RESTRICT w_rand = ctx->scratch_w.data();
-        std::fill(w_rand, w_rand + D, 0.0f);
-
-        if (do_strategy_c) {
-          std::uniform_int_distribution<int> cache_dist(
-              0, (int)ctx->dir_cache.size() - 1);
-          const auto& cached_w = ctx->dir_cache[cache_dist(rng)];
-          float alpha = dist(rng) * 0.6f + 0.2f;
-          float one_minus_alpha = 1.0f - alpha;
-          for (int d = 0; d < D; d++) {
-            w_rand[d] = one_minus_alpha * cached_w[d];
-          }
-          for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
-            int d = parent_nz.indices[i_nz];
-            w_rand[d] += alpha * parent_nz.values[i_nz];
-          }
-        } else {
-          for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
-            w_rand[parent_nz.indices[i_nz]] = parent_nz.values[i_nz];
-          }
-
-          if (do_strategy_a) {
-            std::uniform_int_distribution<int> parent_idx_dist(
-                0, parent_nz.size - 1);
-            int idx1 = parent_idx_dist(rng);
-            float s1 =
-                dist(rng) * 2.0f * local_mutation_rate - local_mutation_rate;
-            w_rand[parent_nz.indices[idx1]] *= (1.0f + s1);
-
-            if (parent_nz.size > 2 && dist(rng) < 0.5f) {
-              int idx2 = parent_idx_dist(rng);
-              while (idx2 == idx1) idx2 = parent_idx_dist(rng);
-              float s2 =
-                  dist(rng) * 2.0f * local_mutation_rate - local_mutation_rate;
-              w_rand[parent_nz.indices[idx2]] *= (1.0f + s2);
-            }
-          } else if (do_strategy_b) {
-            if (!b_ready) {
-              auto& candidate_probs = ctx->scratch_cand_probs;
-              candidate_feats.clear();
-              candidate_probs.clear();
-              for (int d = 0; d < D; d++) {
-                bool in_parent = false;
-                for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
-                  if (parent_nz.indices[i_nz] == d) {
-                    in_parent = true;
-                    break;
-                  }
-                }
-                if (!in_parent) {
-                  candidate_feats.push_back(d);
-                  candidate_probs.push_back(prob[d]);
-                }
-              }
-              new_feat_dist = std::discrete_distribution<int>(
-                  candidate_probs.begin(), candidate_probs.end());
-              b_ready = true;
-            }
-
-            if (!candidate_feats.empty()) {
-              int idx_feat = new_feat_dist(rng);
-              int f_new = candidate_feats[idx_feat];
-              float sign = (cg_s[f_new] >= 0.0f) ? -1.0f : 1.0f;
-              w_rand[f_new] = sign * local_mutation_strength;
-            } else if (parent_nz.size == 1) {
-              int f_new = (parent_nz.indices[0] + 1) % D;
-              w_rand[f_new] = 0.1f;
-            }
-          }
-        }
-
         float norm = 0.0f;
-        for (int d = 0; d < D; d++) norm += w_rand[d] * w_rand[d];
-        norm = std::sqrt(norm);
-        if (dirs_n < OQBoostCtx::DIRS_MAX) {
-          float* GF_RESTRICT slot = dirs_flat + (size_t)dirs_n * D;
-          if (norm > 1e-12f) {
-            float inv_norm = 1.0f / norm;
-            for (int d = 0; d < D; d++) slot[d] = w_rand[d] * inv_norm;
-          } else {
-            // Fallback: keep parent's first nonzero direction.
-            std::fill(slot, slot + D, 0.0f);
-            slot[parent_nz.indices[0]] = parent_nz.values[0];
-          }
-          dirs_n++;
+        for (int a = 0; a < uk; a++) {
+          float v = use_sign ? ((cg_j[order[a]] >= 0.0f) ? 1.0f : -1.0f)
+                             : cg_j[order[a]];
+          norm += v * v;
         }
-        if (gain_log) fam.push_back(do_strategy_c ? 'c' : (do_strategy_a ? 'a' : 'b'));
+        norm = std::sqrt(norm);
+        if (norm < 1e-12f) return;
+        float* GF_RESTRICT slot = dirs_flat + (size_t)dirs_n * D;
+        std::fill(slot, slot + D, 0.0f);
+        float inv = 1.0f / norm;
+        for (int a = 0; a < uk; a++) {
+          float v = use_sign ? ((cg_j[order[a]] >= 0.0f) ? 1.0f : -1.0f)
+                             : cg_j[order[a]];
+          slot[didx[order[a]]] = v * inv;
+        }
+        dirs_n++;
+        if (gain_log) fam.push_back(tag);
+      };
+
+      if (K == 2) {
+        // Binary: the two class gradients are antisymmetric (g0=-g1 under
+        // softmax), so the dominant-class covariance cg_s captures all signal.
+        // Diagonal-Hessian Newton direction w*_d ∝ cg_s_d / add_s_d (add_s =
+        // Σh·x²) — the H≈diag maximizer of the proxy J(w). Scale-invariant:
+        // plain H≈σI (raw cg_s) is hijacked by large-scale features on
+        // unstandardized data (adult fnlwgt ~1e5), collapsing oblique gain.
+        // Emitting both σI and diag was tested and lost to diag-only — extra
+        // candidates let the gain tournament overfit (DGCS wants few, correct
+        // directions, not many).
+        float cgj[D_SUB_MAX];
+        for (int i = 0; i < dn; i++)
+          cgj[i] = cg_s[didx[i]] / (add_s[didx[i]] + reg_lambda + EPS);
+        emit_dir(cgj, 0, false, 'g');  // full diag-Newton covariance
+        emit_dir(cgj, 0, true,  's');  // gradient-sign direction (±1)
+        emit_dir(cgj, 2, false, '2');  // top-2 sparse
+        emit_dir(cgj, 4, false, '4');  // top-4 sparse
+      } else {
+        // Multiclass: one covariance direction PER class — each class has its
+        // own gradient geometry; the dominant-class-only direction underfits.
+        //   cg^(c)[j] = Σ_i Xe[i,didx[j]] · G[i,c]
+        // σI form (no add-normalization): diag-Newton was tested and regressed
+        // multiclass (synthetic 0.911→0.897) — per-class add normalization
+        // distorts cross-class scale. Revisit for raw multiclass (covertype).
+        float cgc[D_SUB_MAX];
+        for (int c = 0; c < K; c++) {
+          for (int j = 0; j < dn; j++) {
+            int d = didx[j];
+            float s = 0.0f;
+            for (int i = 0; i < ne; i++)
+              s += Xe_ptr[(size_t)i * D + d] * G[(size_t)samp_e[i] * K + c];
+            cgc[j] = s;
+          }
+          emit_dir(cgc, 0, false, 'c');  // per-class full covariance
+          emit_dir(cgc, 4, false, 'c');  // per-class top-4 sparse
+        }
       }
-
-      // Diversity slot of the inherited branch (nonzero when
-      // inherited_rp_ratio < 1): pobs blocks.
-      fill_pobs(n_global);
-
-    } else {
-      // Root/no-parent pool: all pobs blocks.
-      fill_pobs(pool_budget);
     }
 
-    if (n_pobs_extra > 0) fill_pobs(n_pobs_extra);
-
-    // Cached directions enter the candidate batch directly: with the batched
-    // panel projections below, evaluating all of them exactly costs less than
-    // the old approximate 512-sample pre-screen pass did, and removes its
-    // sampling noise.
-    for (const auto& cw : ctx->dir_cache) {
-      if (dirs_n < OQBoostCtx::DIRS_MAX) {
+    // Direction cache (deterministic cross-tree memory, NOT random search):
+    // directions that won a split in EARLIER trees are replayed as candidates
+    // here. The per-node DGCS direction is the local gradient-covariance
+    // optimum; the cache adds globally-proven oblique directions the current
+    // node's gradient may not point at yet. dir_cache is filled in the growth
+    // loop (numeric-only; cache_direction skips cat dims).
+    //
+    // Gated to large nodes only (ns >= CACHE_MIN): on small nodes the local
+    // gradient already determines a good direction, and replaying cross-tree
+    // directions there overfits (breast-cancer 426-row: 0.972 → 0.951). On
+    // large nodes the cache recovers the gain that the removed random pool used
+    // to provide (adult numeric: 0.900 → 0.920, matching the old GG-SRP pool).
+    static constexpr int CACHE_MIN = 512;
+    if (ns >= CACHE_MIN) {
+      for (const auto& cw : ctx->dir_cache) {
+        if (dirs_n >= OQBoostCtx::DIRS_MAX) break;
         std::memcpy(dirs_flat + (size_t)dirs_n * D, cw.data(),
                     (size_t)D * sizeof(float));
         dirs_n++;
+        if (gain_log) fam.push_back('k');
       }
-      if (gain_log) fam.push_back('k');
     }
 
     float ob_gain = 0.0f, ob_thr = 0.0f;
@@ -1377,6 +1304,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     if (gain_log) {
       static int node_seq = 0;
       int nid = node_seq++;
+      int depth_t = get_node_depth(t);
       // Axis-scan best gain for this node (family 'x'; computed on the full
       // node, so its scale differs slightly from the samp_e-estimated pool
       // gains — compare within the pool, use 'x' as the per-node baseline).
