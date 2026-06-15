@@ -171,6 +171,54 @@ def _best_threshold(proj: torch.Tensor, G: torch.Tensor, H: torch.Tensor,
     return best_t, best_gain
 
 
+def goe_insert(clusters: list, w: torch.Tensor, gain: float, tau: float = 0.95):
+    """Online Global Oblique Estimator update. Instead of a FIFO buffer,
+    accumulate repeated high-gain directions into running-mean clusters:
+    a new direction either merges into the most-similar cluster (running mean +
+    gain accumulation) or seeds a new cluster. This reduces variance by
+    averaging noisy observations of the same underlying global oblique axis."""
+    norm = float(w.norm())
+    if norm < 1e-12:
+        return
+    wn = (w / norm).detach().cpu()
+    best_i, best_s = -1, tau
+    for i, c in enumerate(clusters):
+        s = float(abs(torch.dot(c['mean'], wn)))
+        if s > best_s:
+            best_s, best_i = s, i
+    if best_i >= 0:
+        c = clusters[best_i]
+        sgn = 1.0 if float(torch.dot(c['mean'], wn)) >= 0 else -1.0
+        m = c['mean'] * c['count'] + sgn * wn
+        mn = float(m.norm())
+        c['mean'] = m / mn if mn > 1e-12 else c['mean']
+        c['gain_sum'] += gain
+        c['count'] += 1
+    else:
+        clusters.append({'mean': wn, 'gain_sum': max(gain, 0.0), 'count': 1})
+
+
+def goe_global(clusters: list, device, dtype) -> torch.Tensor | None:
+    """Gain-weighted fusion of all clusters → global oblique direction w_G.
+    β_i = gain_i/Σgain; sign-aligned to the highest-gain cluster so orthogonal
+    clusters don't cancel."""
+    if not clusters:
+        return None
+    gsum = sum(max(c['gain_sum'], 0.0) for c in clusters)
+    if gsum <= 1e-12:
+        return None
+    ref = max(clusters, key=lambda c: c['gain_sum'])['mean']
+    wg = torch.zeros_like(ref)
+    for c in clusters:
+        b = max(c['gain_sum'], 0.0) / gsum
+        sgn = 1.0 if float(torch.dot(c['mean'], ref)) >= 0 else -1.0
+        wg += b * sgn * c['mean']
+    n = float(wg.norm())
+    if n < 1e-12:
+        return None
+    return (wg / n).to(device=device, dtype=dtype)
+
+
 def _angle_deg(a: torch.Tensor, b: torch.Tensor) -> float:
     """Unsigned angle in degrees between two vectors."""
     cos = float(torch.clamp(
@@ -411,6 +459,7 @@ class OQBoostResearchTree:
         winning_history: Optional[list] = None,
         diversity_mode: str = 'iid',  # 'iid' | 'pobs' | 'pobs_sis'
         record_alignment: bool = False,
+        goe: Optional[list] = None,   # per-class GOE clusters (cross-tree)
     ):
         self.max_depth = max_depth
         self.reg_lambda = reg_lambda
@@ -432,6 +481,7 @@ class OQBoostResearchTree:
         self.winning_history = winning_history
         self.diversity_mode = diversity_mode
         self.record_alignment = record_alignment
+        self.goe = goe
 
         self.root_: Optional[Node] = None
         self.split_records_: list[SplitRecord] = []
@@ -488,6 +538,13 @@ class OQBoostResearchTree:
             sub = torch.arange(N, device=X.device)
 
         self.n_root_ = len(sub)
+        # Round-global gradient covariance (fresh prior for shrinkage). Computed
+        # over the whole subsample with the global dominant class. Unlike GOE's
+        # stale cross-tree directions, this is the CURRENT round's gradient
+        # geometry → a valid Bayesian prior to shrink noisy node estimates to.
+        kg = _dominant_class(G[sub])
+        self._global_cg_ = -(X[sub].T @ G[sub, kg])  # (D,)
+        self._n_global_ = float(len(sub))
         out = torch.zeros(N, K, dtype=X.dtype, device=X.device)
         self.root_ = self._build(X, G, H, sub, depth=0, lineage_w=[], out=out)
         return out
@@ -575,6 +632,16 @@ class OQBoostResearchTree:
         elif mode == 'gg_srp':
             is_px_mode = True
         elif mode == 'grad_cov_det':
+            is_px_mode = True
+        elif mode == 'grad_cov_embed':
+            is_px_mode = True
+        elif mode == 'grad_cov_iso':
+            is_px_mode = True
+        elif mode == 'grad_cov_blend':
+            is_px_mode = True
+        elif mode == 'grad_cov_goe':
+            is_px_mode = True
+        elif mode == 'grad_cov_shrink':
             is_px_mode = True
         else:
             parts = mode.split('_')
@@ -669,8 +736,12 @@ class OQBoostResearchTree:
                     w_r[top_feat] = signs
                     w_r = w_r / (w_r.norm() + 1e-8)
                     candidates.append((w_r, 'random'))
-            elif mode == 'grad_cov_det':
+            elif mode in ('grad_cov_det', 'grad_cov_blend', 'grad_cov_goe'):
                 # Deterministic Gradient Covariance Scan (DGCS).
+                # grad_cov_blend: + gain-weighted blend of candidates (below).
+                # grad_cov_goe:   + Global Oblique Estimator direction w_G from
+                #                   the per-class cluster cache, then α-blended
+                #                   with the local DGCS optimum (below).
                 # All candidates derived analytically from data — zero RNG.
                 # Candidates:
                 #   axis(d_sub) + gcov_full + gcov_sign + gcov_top2 + gcov_top4
@@ -726,6 +797,133 @@ class OQBoostResearchTree:
 
                 # Note: WLS (A^{-1} G_vec) was tested but hurts real tabular data
                 # due to Hessian noise overfitting at small nodes. Excluded.
+
+            elif mode == 'grad_cov_shrink':
+                # Variance-reduction by SHRINKAGE (replaces direction caching).
+                # Shrink the noisy node covariance cg_node toward the round-
+                # global covariance cg_global (fresh prior). β = τ/(n_node+τ):
+                # small/noisy nodes lean on the global prior, large nodes keep
+                # their local estimate. Direct James-Stein, no cache structure.
+                for f in top_feat:
+                    w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w[f] = 1.0
+                    candidates.append((w, 'axis'))
+                X_sub = X_node[:, top_feat]
+                g_k = G_node[:, k_dom]
+                top_feat_t = torch.tensor(top_feat, dtype=torch.long, device=X_node.device)
+                cg_node = -(X_sub.T @ g_k)              # (d_sub,)
+                n_node = float(N)
+                cg_glob = self._global_cg_[top_feat_t]  # (d_sub,) round-global
+                tau = math.sqrt(self.n_root_)           # shrinkage strength
+                beta = tau / (n_node + tau)
+                G_vec = ((1.0 - beta) * cg_node / n_node
+                         + beta * cg_glob / self._n_global_)
+                nrm = G_vec.norm()
+                if nrm > 1e-8:
+                    wf = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    wf[top_feat_t] = G_vec / nrm
+                    candidates.append((wf, 'shrink_full'))
+                av = G_vec.abs()
+                for kk in (2, 4):
+                    if len(top_feat) >= kk:
+                        ti = av.topk(kk).indices
+                        wt = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        wt[top_feat_t[ti]] = G_vec[ti]
+                        nn = wt.norm()
+                        if nn > 1e-8:
+                            candidates.append((wt / nn, f'shrink_top{kk}'))
+
+            elif mode == 'grad_cov_embed':
+                # Unified-framework completion test: embed EVERY feature as
+                # φ_j = E[g|bin_j(x)] (gradient response), then DGCS on φ. This
+                # makes numeric/categorical/missing identical. Hypothesis: the
+                # embed covariance score = Var(E[g|bin]) = train explained
+                # variance, which OVERFITS for high-cardinality numeric (many
+                # bins) — so numeric-raw should beat numeric-embed.
+                import os as _os
+                if not _os.getenv("OQB_NOAXIS"):
+                    for f in top_feat:
+                        w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        w[f] = 1.0
+                        candidates.append((w, 'axis'))
+
+                X_sub = X_node[:, top_feat]
+                g_k = G_node[:, k_dom]
+                h_k = H_node[:, k_dom]
+                nb = 32
+                phi = torch.zeros_like(X_sub)
+                for j in range(X_sub.shape[1]):
+                    col = X_sub[:, j]
+                    ranks = torch.argsort(torch.argsort(col))
+                    b = (ranks * nb // len(col)).clamp(max=nb - 1)
+                    for bb in range(nb):
+                        msk = b == bb
+                        if msk.any():
+                            phi[msk, j] = (g_k[msk].sum()
+                                           / (h_k[msk].sum() + self.reg_lambda))
+                G_vec = (phi * g_k.unsqueeze(1)).sum(0)  # cov(φ,g) = Var(E[g|bin])
+                top_feat_t = torch.tensor(top_feat, dtype=torch.long, device=X_node.device)
+                nrm = G_vec.norm()
+                if nrm > 1e-8:
+                    w_full = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w_full[top_feat_t] = G_vec / nrm
+                    candidates.append((w_full, 'embed_full'))
+
+                # raw covariance direction too (orthogonal info: linear oblique
+                # signal that embed's E[g|bin] step washes out). Hybrid.
+                G_raw = -(X_sub.T @ g_k)
+                nr = G_raw.norm()
+                if nr > 1e-8:
+                    wr = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    wr[top_feat_t] = G_raw / nr
+                    candidates.append((wr, 'raw_full'))
+                av = G_vec.abs()
+                for kk in (2, 4):
+                    if len(top_feat) >= kk:
+                        ti = av.topk(kk).indices
+                        wt = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        wt[top_feat_t[ti]] = G_vec[ti]
+                        nn = wt.norm()
+                        if nn > 1e-8:
+                            candidates.append((wt / nn, f'embed_top{kk}'))
+
+            elif mode == 'grad_cov_iso':
+                # THE unified theory: φ_j = isotonic E[g|x_j] (monotone gradient
+                # response). Linear g→x recovers raw cov; monotone-nonlinear g→x
+                # gives the embed effect; one formula, raw is a special case.
+                from sklearn.isotonic import IsotonicRegression
+                for f in top_feat:
+                    w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w[f] = 1.0
+                    candidates.append((w, 'axis'))
+                X_sub = X_node[:, top_feat]
+                g_k = G_node[:, k_dom]
+                gnp = g_k.detach().cpu().numpy()
+                phi = torch.zeros_like(X_sub)
+                for j in range(X_sub.shape[1]):
+                    xj = X_sub[:, j].detach().cpu().numpy()
+                    ir = IsotonicRegression(increasing="auto", out_of_bounds="clip")
+                    try:
+                        pj = ir.fit_transform(xj, gnp)
+                    except Exception:
+                        pj = xj
+                    phi[:, j] = torch.tensor(pj, dtype=X_sub.dtype, device=X_node.device)
+                G_vec = (phi * g_k.unsqueeze(1)).sum(0)
+                top_feat_t = torch.tensor(top_feat, dtype=torch.long, device=X_node.device)
+                nrm = G_vec.norm()
+                if nrm > 1e-8:
+                    wf = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    wf[top_feat_t] = G_vec / nrm
+                    candidates.append((wf, 'iso_full'))
+                av = G_vec.abs()
+                for kk in (2, 4):
+                    if len(top_feat) >= kk:
+                        ti = av.topk(kk).indices
+                        wt = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        wt[top_feat_t[ti]] = G_vec[ti]
+                        nn = wt.norm()
+                        if nn > 1e-8:
+                            candidates.append((wt / nn, f'iso_top{kk}'))
 
             elif mode == 'proxy_search':
                 for f in top_feat:
@@ -1423,9 +1621,11 @@ class OQBoostResearchTree:
         H_node_cpu = H_node.cpu()
 
         best_oblique_gain = None
+        cand_gains = []  # (gain, w) for gain-weighted blend
         for idx_cand, (w, ctype) in enumerate(candidates):
             proj = all_proj_cpu[:, idx_cand]
             thresh, gain = _best_threshold(proj, G_node_cpu, H_node_cpu, self.reg_lambda)
+            cand_gains.append((gain, w))
             if ctype != 'axis':
                 if best_oblique_gain is None or gain > best_oblique_gain:
                     best_oblique_gain = gain
@@ -1434,6 +1634,60 @@ class OQBoostResearchTree:
                 best_w = w
                 best_thresh = thresh
                 best_type = ctype
+
+        # gain-weighted blend: variance reduction by combining ALL positive-gain
+        # directions, weighted by gain, sign-aligned to the current best so
+        # orthogonal/opposite directions don't cancel. A noisy local optimum
+        # gets pulled toward the consensus of high-gain directions.
+        if mode == 'grad_cov_blend':
+            wb = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+            wsum = 0.0
+            ref = best_w.to(X_node.device)
+            for gain, w in cand_gains:
+                if gain <= 0:
+                    continue
+                wd = w.to(X_node.device)
+                s = 1.0 if float(torch.dot(wd, ref)) >= 0 else -1.0
+                wb += gain * s * wd
+                wsum += gain
+            nb = float(wb.norm())
+            if wsum > 0 and nb > 1e-8:
+                wb = wb / nb
+                proj_b = (X_node @ wb).cpu()
+                tb, gb = _best_threshold(proj_b, G_node_cpu, H_node_cpu, self.reg_lambda)
+                if gb > best_gain:
+                    best_gain = gb
+                    best_w = wb
+                    best_thresh = tb
+                    best_type = 'blend'
+
+        # GOE α-blend: w_final = (1-α)·w_L + α·w_G, α = G(w_G)/(G(w_L)+G(w_G)).
+        # w_L = best local DGCS direction so far; w_G = gain-weighted global
+        # estimator from the per-class cluster cache. α is gain-driven (good
+        # global → blend more), matching "Direction=Candidate, Gain=Judge".
+        if mode == 'grad_cov_goe' and self.goe is not None:
+            clusters = self.goe[k_dom] if k_dom < len(self.goe) else None
+            w_G = goe_global(clusters, X_node.device, X_node.dtype) if clusters else None
+            if w_G is not None:
+                w_L = best_w.to(X_node.device)
+                g_L = max(best_gain, 0.0)
+                proj_G = (X_node @ w_G).cpu()
+                _, g_G = _best_threshold(proj_G, G_node_cpu, H_node_cpu, self.reg_lambda)
+                g_G = max(g_G, 0.0)
+                if g_L + g_G > 1e-12:
+                    alpha = g_G / (g_L + g_G)
+                    s = 1.0 if float(torch.dot(w_L, w_G)) >= 0 else -1.0
+                    w_fin = (1.0 - alpha) * w_L + alpha * s * w_G
+                    nf = float(w_fin.norm())
+                    if nf > 1e-8:
+                        w_fin = w_fin / nf
+                        proj_f = (X_node @ w_fin).cpu()
+                        tf, gf = _best_threshold(proj_f, G_node_cpu, H_node_cpu, self.reg_lambda)
+                        if gf > best_gain:
+                            best_gain = gf
+                            best_w = w_fin
+                            best_thresh = tf
+                            best_type = 'goe'
 
         # Alignment metrics tracking
         cos_oracle = None
@@ -1452,6 +1706,12 @@ class OQBoostResearchTree:
 
         if best_gain <= 0:
             return best_w, best_thresh, best_gain, None
+
+        # GOE update: accumulate the winning oblique direction into the per-class
+        # cluster cache (running mean + gain accumulation). Axis winners skip.
+        if mode == 'grad_cov_goe' and self.goe is not None and best_type != 'axis':
+            if k_dom < len(self.goe):
+                goe_insert(self.goe[k_dom], best_w, best_gain)
 
         record = SplitRecord(
             tree_idx=self.tree_idx,
@@ -1600,6 +1860,7 @@ class OQBoostResearch:
         N, _ = X_t.shape
         K = int(y_t.max().item()) + 1
         self.classes_ = np.unique(y)
+        self.goe_: list[list] = [[] for _ in range(K)]  # per-class GOE clusters
 
         rng = torch.Generator(device=self.device)
         rng.manual_seed(self.random_state)
@@ -1650,6 +1911,7 @@ class OQBoostResearch:
                 n_inherit=self.n_inherit,
                 dir_cache=self.dir_cache_,
                 winning_history=self.winning_history_,
+                goe=self.goe_,
                 diversity_mode=self.diversity_mode,
                 record_alignment=self.record_alignment,
             )

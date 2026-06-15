@@ -20,10 +20,10 @@ OQBoost는 기존의 축 정렬 분기(axis-aligned splits) 대신 그라디언�
 | 특징 | 설명 |
 |------|------|
 | **분기 타입 (Split type)** | 사선 분기 (Oblique split, 여러 피처들의 선형 사영 결합) |
-| **방향 탐색 (Direction finding)** | GG-SRP: 그라디언트 유도형 희소 무작위 사영 |
-| **상속 구조 (Inheritance)** | 부모 노드의 분기 방향 가중치를 상속하고 깊이에 비례해 감쇠하는 변이 적용 |
-| **결측치 지원 (Missing values)** | 네이티브 지원 — C++ 내부에서 실시간 평균 대체로 NaN 처리 |
-| **범주형 피처 지원 (Categorical features)** | 네이티브 지원 — 라운드별 그라디언트 랭크(gradient-rank) 타겟 인코딩 |
+| **방향 탐색 (Direction finding)** | DGCS: 결정론적 그래디언트-공분산 스캔 (RNG·탐색 없음) |
+| **피처 처리 (Feature handling)** | 통합 — 연속형/범주형/결측치 모두 그래디언트 반응 $\phi=E[g\mid\cdot]$로 임베딩 |
+| **결측치 지원 (Missing values)** | 네이티브 — 그래디언트 적응형 임베딩 (수치형·범주형) |
+| **범주형 피처 지원 (Categorical features)** | 네이티브 — 라운드별 그래디언트 반응 인코딩 |
 | **지원 작업 (Tasks)** | 분류 (`OQBoostClassifier`) + 회귀 (`OQBoostRegressor`) |
 | **API 호환성** | scikit-learn API 완벽 호환 |
 | **백엔드 엔진** | OpenMP 병렬 컴파일된 C++ 백엔드 |
@@ -187,10 +187,10 @@ OQBoost는 **DGCS (Direct Gradient-Covariance Scan, 직접 경사-공분산 스�
 ### DGCS (Direct Gradient-Covariance Scan)
 노드 분기를 수행할 때, 다음의 2차 분기 이득 프록시(split-gain proxy) $J(w)$를 최대화하는 사영 방향 $w$를 찾는 것이 목표입니다:
 $$J(w) = \frac{(w^T G)^2}{w^T H w + \lambda \|w\|^2}$$
-여기서 $G[d] = \sum_{i} x_{id} g_i$는 그라디언트-피처 간의 공분산(gradient-feature covariance)입니다.
-헤시안이 고르게 분포한다는 가정($H \approx \sigma I$) 아래, 수식상의 최대점은 다음과 같은 닫힌 형식(closed-form) 솔루션을 가집니다:
-$$w^* \propto G$$
-OQBoost는 이 닫힌 형식 해를 직접 계산함으로써 복잡한 선형 시스템을 풀거나 수치 최적화 루프를 돌지 않고도 $O(N \cdot d_{\text{sub}})$ 복잡도만으로 최적의 사선 분기 방향을 바로 도출합니다.
+여기서 $G[d] = \sum_{i} \phi_d(x_i)\, g_i$는 그래디언트-피처 공분산입니다.
+헤시안을 대각 $A_d = \sum_i h_i \phi_d^2$로 근사하면, 닫힌 형식 최대점은 feature별 Newton 반응값입니다:
+$$w^*_d \propto \frac{G_d}{A_d + \lambda}$$
+이는 **스케일 불변**입니다 — $H\approx\sigma I$ 형태($w \propto G$)는 큰 스케일의 원시 feature에 지배되어 비정규화 데이터에서 붕괴하지만, $A_d$로 나누면 제거됩니다. 정확한 WLS 해 $w = A^{-1}G$는 작은 노드의 노이즈 헤시안에 과적합하므로, 대각 형태를 암묵적 정규화로 사용합니다. OQBoost는 이를 $O(N \cdot d_{\text{sub}})$로 직접 계산 — 선형 시스템도, 반복 최적화도, RNG도 없습니다.
 
 ### 후보군 (Candidate Families)
 데이터의 희소성(Sparsity) 대응 및 다중 클래스 지원을 위해 DGCS는 다음의 사영 방향 후보들을 스캔하여 가장 우수한 분기를 선택합니다:
@@ -199,8 +199,13 @@ OQBoost는 이 닫힌 형식 해를 직접 계산함으로써 복잡한 선형 �
 - **`2` / `4` (희소 공분산, Sparse Covariance)**: 공분산 크기 기준 상위 2개 또는 4개의 피처만 사영에 참여시켜 해석 가능성이 높은 희소 사선 분기를 형성합니다.
 - **`c` (클래스별 공분산, Per-class Covariance)**: 다중 클래스 환경에서 각 클래스의 개별 그라디언트를 바탕으로 전체 공분산 및 상위 4개 희소 공분산 벡터를 각각 계산하여 모든 클래스의 분별 성능을 보장합니다.
 
-### 방향 캐시 (Direction Cache)
-이전 트리들에서 분기를 획득하여 성능이 증명된 최적 방향들은 전역 링 버퍼인 `dir_cache`에 저장됩니다. 대형 노드($N \ge 512$)들은 로컬 경사-공분산 최적점 외에 이 캐시된 전역 우수 방향들을 추가 후보로 스캔하여 학습 효율을 극대화합니다.
+### 통합 Feature 프레임워크 (Unified Feature Framework)
+모든 feature 타입이 단일 임베딩 $\phi$로 매핑되고, 이후 DGCS는 $\operatorname{Cov}(\phi, g)$만 보며 타입을 구분하지 못합니다:
+- **연속형**: $\phi = x$
+- **범주형**: $\phi(c) = G_c / (H_c + \lambda)$ — 매 라운드 재계산되는 그래디언트 반응 (CatBoost의 정적 $E[y\mid c]$와 달리 $E[g\mid c]$로, 현재 부스팅 잔차에 적응)
+- **결측 (수치형·범주형)**: $\phi(\text{NaN}) = G_\text{miss} / (H_\text{miss} + \lambda)$ — 별도 상태로 취급되어, 그래디언트와 상관된 결측 신호가 공분산에 반영
+
+연속형·범주형·결측이 하나의 공분산 파이프라인을 흐릅니다. 축 스캔(학습된 결측 기본 방향을 가진 표준 히스토그램 분할)이 사선 DGCS 후보와 함께 실행되며, 이득이 최대인 분할이 선택됩니다.
 
 수리적 유도 과정은 [`docs/algorithm.md`](docs/algorithm.md)에서, 상세 연구 및 실험 로그는 [`docs/THEORY.md`](docs/THEORY.md)에서 확인하실 수 있습니다.
 
@@ -230,7 +235,7 @@ OQBoost는 대규모 정형 데이터셋의 고속 학습 및 추론을 지원�
 | `reg_lambda` | 1.0 | 리프 스코어 가중치에 대한 L2 규제 강도 |
 | `reg_alpha` | 0.0 | 리프 가중치에 대한 L1 규제 (그라디언트 소프트 임계) |
 | `subsample` | 0.8 | 각 트리 빌드 시 무작위 샘플링 비율 (`goss=True`이면 무시) |
-| `goss` | True | Gradient-based One-Side Sampling — 큰 그라디언트 행은 전부 유지, 나머지는 서브샘플링 |
+| `goss` | False | Gradient-based One-Side Sampling — 큰 그라디언트 행은 전부 유지, 나머지는 서브샘플링 |
 | `goss_top_rate` | 0.2 | GOSS: 항상 유지할 큰 그라디언트 행의 비율 |
 | `goss_other_rate` | 0.1 | GOSS: 나머지 행 중 샘플링할 비율 |
 | `gamma` | 0.0 | 분기를 수행하기 위한 최소 게인 임계치 |
@@ -243,12 +248,12 @@ OQBoost는 대규모 정형 데이터셋의 고속 학습 및 추론을 지원�
 | `cat_features` | None | 범주형 피처 컬럼 명칭(DataFrame) 또는 컬럼 인덱스 목록 |
 | `class_weight` | None | `"balanced"` 설정 시 사전 확률 보정 의사결정 규칙 적용 (확률값은 보정 유지) |
 | `prior_alpha` | 0.5 | balanced 보정 강도: 0 = 순수 argmax, 1 = 완전 사전확률 보정 |
-| `inherited_rp_ratio` | 1.0 | 사용되지 않음 (Legacy, v0.1.8부터 폐지) |
-| `mutation_rate` | 0.1 | 사용되지 않음 (Legacy, v0.1.8부터 폐지) |
-| `mutation_strength` | 0.5 | 사용되지 않음 (Legacy, v0.1.8부터 폐지) |
-| `pobs` | False | 사용되지 않음 (Legacy, v0.1.8부터 폐지) |
-| `random_state` | None | 난수 고정 시드 |
+| `random_state` | None | 난수 시드 (DGCS는 결정론적; 행 서브샘플링에만 영향) |
 | `verbose` | False | 학습 과정 모니터링 출력 여부 |
+
+> 분기 방향 엔진은 완전 결정론적(DGCS)이므로 **유효한 트리 하이퍼파라미터는
+> `max_depth`와 `reg_lambda` 둘뿐**입니다. 기존 확률적 풀 관련 인자
+> (`inherited_rp_ratio`, `mutation_rate`, `mutation_strength`, `pobs`)는 제거되었습니다.
 
 `OQBoostRegressor`는 위 트리/샘플링 매개변수를 동일하게 받으며, 추가로 `loss`(`"squared_error"` 또는 `"huber"`)와 `huber_delta`(1.0)를 지원합니다.
 

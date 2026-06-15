@@ -25,12 +25,12 @@
             "l2_leaf_reg": 10.700922170449806
         },
         "OQBoost": {
-            "learning_rate": 0.044374576077235404,
+            "learning_rate": 0.04804987947923438,
             "max_depth": 6,
-            "reg_lambda": 0.44455449232864735,
-            "reg_alpha": 1.0437389617737958e-08,
-            "colsample_bynode": 0.566439469324352,
-            "min_child_weight": 5.304074808163702
+            "reg_lambda": 3.467458118646456,
+            "reg_alpha": 1.4794856834053684e-05,
+            "colsample_bynode": 0.5281171610173382,
+            "min_child_weight": 14.598445152317321
         }
     },
     "credit_default": {
@@ -59,12 +59,12 @@
             "l2_leaf_reg": 12.983471024620178
         },
         "OQBoost": {
-            "learning_rate": 0.1921687799704932,
-            "max_depth": 4,
-            "reg_lambda": 19.592742627847457,
-            "reg_alpha": 1.0235710877965194e-07,
-            "colsample_bynode": 0.7420966539805748,
-            "min_child_weight": 12.87082234669381
+            "learning_rate": 0.1725783520265476,
+            "max_depth": 5,
+            "reg_lambda": 11.880856204140935,
+            "reg_alpha": 2.1821329799172432e-06,
+            "colsample_bynode": 0.7584933757829235,
+            "min_child_weight": 13.419733234927083
         }
     },
     "give_me_some_credit": {
@@ -93,12 +93,12 @@
             "l2_leaf_reg": 16.448560631799594
         },
         "OQBoost": {
-            "learning_rate": 0.19888079358191438,
-            "max_depth": 7,
-            "reg_lambda": 17.49611427903066,
-            "reg_alpha": 0.010296379878685633,
-            "colsample_bynode": 0.6881536582963377,
-            "min_child_weight": 18.538437955071988
+            "learning_rate": 0.1710904337220185,
+            "max_depth": 8,
+            "reg_lambda": 18.427442829829726,
+            "reg_alpha": 1.852413012503069,
+            "colsample_bynode": 0.5652775521330299,
+            "min_child_weight": 1.5082018699084827
         }
     },
     "covertype": {

@@ -23,10 +23,7 @@ OQBoostClassifier(
     cat_features=None,
     class_weight=None,
     prior_alpha=0.5,
-    inherited_rp_ratio=1.0,
-    mutation_rate=0.1,
-    mutation_strength=0.5,
-    pobs=False,
+    goss=False,
 )
 ```
 
@@ -45,10 +42,11 @@ OQBoostClassifier(
 | `cat_features` | list or None | None | Categorical column names (DataFrame) or indices |
 | `class_weight` | str or None | None | "balanced" reweights by inverse class frequency |
 | `prior_alpha` | float | 0.5 | Strength of balanced reweighting prior correction (0 to 1) |
-| `inherited_rp_ratio` | float | 1.0 | Cache-direction candidate fraction |
-| `mutation_rate` | float | 0.1 | Noise scale for inherited directions |
-| `mutation_strength` | float | 0.5 | Weight of borrowed feature in hybrid directions |
-| `pobs` | bool | False | Inject Haar-orthogonal POBS candidates into every node's tournament |
+| `goss` | bool | False | Gradient-based One-Side Sampling for row subsampling |
+
+> Split directions are generated deterministically (DGCS) — only `max_depth` and
+> `reg_lambda` are effective tree hyperparameters. Legacy stochastic-pool knobs
+> (`inherited_rp_ratio`, `mutation_rate`, `mutation_strength`, `pobs`) were removed.
 
 ---
 

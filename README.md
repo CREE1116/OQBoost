@@ -20,10 +20,10 @@ OQBoost replaces axis-aligned splits with gradient-guided oblique hyperplanes co
 | Feature | OQBoost |
 |---------|---------|
 | Split type | Oblique (linear projection of multiple features) |
-| Direction finding | GG-SRP: gradient-guided sparse random projection |
-| Inheritance | Parent weight inheritance with depth-decayed mutation |
-| Missing values | Native — NaN handled via mean imputation in C++ |
-| Categorical features | Native — gradient-rank encoding per round |
+| Direction finding | DGCS: deterministic gradient-covariance scan (no RNG, no search) |
+| Feature handling | Unified: continuous / categorical / missing all embedded as gradient-response $\phi=E[g\mid\cdot]$ |
+| Missing values | Native — gradient-adaptive embedding (numeric & categorical) |
+| Categorical features | Native — per-round gradient-response encoding |
 | Tasks | Classification (`OQBoostClassifier`) + Regression (`OQBoostRegressor`) |
 | API | scikit-learn compatible |
 | Backend | Compiled C++ with OpenMP parallelism |
@@ -187,10 +187,10 @@ OQBoost uses **DGCS (Direct Gradient-Covariance Scan)** to construct oblique spl
 ### DGCS (Direct Gradient-Covariance Scan)
 For a node split, we aim to find a projection direction $w$ that maximizes the second-order split-gain proxy:
 $$J(w) = \frac{(w^T G)^2}{w^T H w + \lambda \|w\|^2}$$
-where $G[d] = \sum_{i} x_{id} g_i$ is the gradient-feature covariance.
-Under the assumption of homoscedasticity ($H \approx \sigma I$), the mathematical maximizer is the closed form:
-$$w^* \propto G$$
-This closed-form solution allows OQBoost to compute the optimal oblique direction directly in $O(N \cdot d_{\text{sub}})$ without solving a costly linear system or running iterative optimization.
+where $G[d] = \sum_{i} \phi_d(x_i)\, g_i$ is the gradient-feature covariance.
+Approximating $H$ by its diagonal $A_d = \sum_i h_i \phi_d^2$, the closed-form maximizer is the per-feature Newton response:
+$$w^*_d \propto \frac{G_d}{A_d + \lambda}$$
+This is **scale-invariant** — the plain $H\approx\sigma I$ form ($w \propto G$) is dominated by large-scale raw features and collapses on unstandardized data; dividing by $A_d$ removes that. The exact WLS solution $w = A^{-1}G$ overfits noisy small-node Hessians, so the diagonal form is used as an implicit regularizer. OQBoost computes this directly in $O(N \cdot d_{\text{sub}})$ — no linear system, no iterative optimization, no RNG.
 
 ### Candidate Families
 To handle different sparsity requirements and multiclass scenarios, DGCS evaluates a small pool of candidate projection directions:
@@ -199,8 +199,14 @@ To handle different sparsity requirements and multiclass scenarios, DGCS evaluat
 - **`2` / `4` (Sparse Covariance)**: Restricts the projection to the top-2 or top-4 features sorted by gradient covariance magnitude, producing sparse, highly interpretable oblique splits.
 - **`c` (Per-class Covariance)**: In multiclass settings, computes full and top-4 sparse covariance vectors for each class gradient, ensuring representation for all target classes.
 
-### Direction Cache
-Directions that win splits in previous trees are stored in a global ring buffer `dir_cache`. Large nodes ($N \ge 512$) evaluate these cached directions to capture globally top-performing patterns across the ensemble, complementing the local gradient-covariance optimum.
+### Unified Feature Framework
+Every feature type maps to one embedding $\phi$, after which DGCS sees only $\operatorname{Cov}(\phi, g)$ and cannot tell the types apart:
+- **continuous**: $\phi = x$
+- **categorical**: $\phi(c) = G_c / (H_c + \lambda)$ — gradient-response, recomputed every round (vs CatBoost's static $E[y\mid c]$; this is $E[g\mid c]$, adapting to the current boosting residual)
+- **missing (numeric & categorical)**: $\phi(\text{NaN}) = G_\text{miss} / (H_\text{miss} + \lambda)$ — treated as its own state, so missingness that correlates with the gradient enters the covariance
+
+Continuous, categorical, and missing all flow through one covariance pipeline. The axis scan (standard histogram split, with a lear
+ned missing default direction) runs alongside the oblique DGCS candidates; the best split by gain wins.
 
 See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation and [`docs/THEORY.md`](docs/THEORY.md) for theoretical insights and experiment logs.
 
@@ -230,7 +236,7 @@ OQBoost is designed for high-throughput training and inference on large-scale ta
 | `reg_lambda` | 1.0 | L2 leaf regularization |
 | `reg_alpha` | 0.0 | L1 leaf regularization (soft-threshold on the gradient) |
 | `subsample` | 0.8 | Row fraction per tree (ignored when `goss=True`) |
-| `goss` | True | Gradient-based One-Side Sampling — keep all large-gradient rows, subsample the rest |
+| `goss` | False | Gradient-based One-Side Sampling — keep all large-gradient rows, subsample the rest |
 | `goss_top_rate` | 0.2 | GOSS: fraction of large-gradient rows always kept |
 | `goss_other_rate` | 0.1 | GOSS: sampling fraction of the remaining rows |
 | `gamma` | 0.0 | Minimum split gain required to make a split |
@@ -243,12 +249,12 @@ OQBoost is designed for high-throughput training and inference on large-scale ta
 | `cat_features` | None | Categorical column names or indices |
 | `class_weight` | None | `"balanced"` applies a prior-corrected decision rule (probabilities stay calibrated) |
 | `prior_alpha` | 0.5 | Strength of the balanced correction: 0 = plain argmax, 1 = full prior correction |
-| `inherited_rp_ratio` | 1.0 | Unused (Legacy, deprecated since v0.1.8) |
-| `mutation_rate` | 0.1 | Unused (Legacy, deprecated since v0.1.8) |
-| `mutation_strength` | 0.5 | Unused (Legacy, deprecated since v0.1.8) |
-| `pobs` | False | Unused (Legacy, deprecated since v0.1.8) |
-| `random_state` | None | Seed |
+| `random_state` | None | Seed (DGCS is deterministic; affects only row subsampling) |
 | `verbose` | False | Print per-round metrics |
+
+> The split-direction engine is fully deterministic (DGCS) — there are only **two effective
+> tree hyperparameters**, `max_depth` and `reg_lambda`. The legacy stochastic-pool knobs
+> (`inherited_rp_ratio`, `mutation_rate`, `mutation_strength`, `pobs`) were removed.
 
 `OQBoostRegressor` takes the same tree/sampling parameters plus `loss` (`"squared_error"` or `"huber"`) and `huber_delta` (1.0).
 

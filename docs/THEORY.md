@@ -1,9 +1,37 @@
-# OQBoost Theory Notes — Why the Candidate Tournament Works
+# OQBoost Theory Notes
 
-Status: working document, 2026-06-12. Companion experiments: `theory_exp1_coherence.py`,
-`theory_exp2_lr_coupling.py`, `theory_exp3_oblivious.py`. Empirical history in
-`FINDINGS.md`. Rule of the road: every engine change must trace back to a claim
-in this file that survived its experiments.
+Status: working document. Empirical history in `FINDINGS.md`. Rule of the road:
+every engine change must trace back to a claim in this file that survived its
+experiments.
+
+---
+
+## 0. Current engine (DGCS) — 2026-06-15
+
+The stochastic candidate tournament described in §1–3 below (GG-SRP random
+projections, parent A/B mutation, direction cache C) has been **fully replaced**
+by the **Deterministic Gradient Covariance Scan (DGCS)**. The notes in §1–3 and
+the experiment log remain as the research history that led here.
+
+Current direction generation, per node (no RNG):
+
+* **Diagonal-Newton covariance direction** $w^*_d \propto G_d / (A_d + \lambda)$,
+  with $G_d = \sum_i \phi_d(x_i) g_i$ (gradient–feature covariance) and
+  $A_d = \sum_i h_i \phi_d^2$ (diagonal Hessian). Scale-invariant; the exact WLS
+  $A^{-1}G$ overfits small-node Hessians, the diagonal form regularizes.
+* **Sparsity variants**: full / sign / top-2 / top-4 (binary); per-class
+  covariance directions (multiclass).
+* **Unified feature embedding** $\phi$: continuous $\phi=x$, categorical
+  $\phi(c)=G_c/(H_c+\lambda)$, missing (numeric & categorical)
+  $\phi(\text{NaN})=G_\text{miss}/(H_\text{miss}+\lambda)$. One covariance
+  framework for all feature types — see `cov_oqboost.md`.
+* **Axis scan** (standard histogram split) runs alongside; best by gain wins.
+
+Variance-reduction add-ons (gain-weighted candidate blend; cross-tree direction
+cache) were evaluated and **removed** — on real tabular data their effect was
+within noise of plain DGCS, and they added cost/complexity. The cache's old
+benefit (recovering the random pool's coverage) was specific to the pre-DGCS
+engine. Two effective tree hyperparameters remain: `max_depth`, `reg_lambda`.
 
 ---
 

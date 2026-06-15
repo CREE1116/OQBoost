@@ -23,10 +23,7 @@ OQBoostClassifier(
     cat_features=None,
     class_weight=None,
     prior_alpha=0.5,
-    inherited_rp_ratio=1.0,
-    mutation_rate=0.1,
-    mutation_strength=0.5,
-    pobs=False,
+    goss=False,
 )
 ```
 
@@ -45,10 +42,11 @@ OQBoostClassifier(
 | `cat_features` | list or None | None | DataFrame의 경우 컬럼명 리스트, ndarray의 경우 컬럼 인덱스 리스트 |
 | `class_weight` | str or None | None | `"balanced"`로 설정 시 클래스 빈도의 역수로 가중치를 재조정하여 예측 |
 | `prior_alpha` | float | 0.5 | `"balanced"` 가중치 사전 보정 시 가중 세기 조절 (0~1 사이값, 0.5는 기하평균 절충안) |
-| `inherited_rp_ratio` | float | 1.0 | 부모 노드 상속 및 글로벌 캐시에서 탐색할 방향 후보 비율 |
-| `mutation_rate` | float | 0.1 | 부모로부터 상속받은 방향 축의 노이즈 강도 설정 |
-| `mutation_strength` | float | 0.5 | 하이브리드 탐색 시 부모 노드 외의 상관 피처 차용 가중치 |
-| `pobs` | bool | False | 토너먼트에 Haar-orthogonal 기반의 무작위 직교 블록 후보(pobs_sis)를 주입할지 여부 |
+| `goss` | bool | False | 행 서브샘플링용 Gradient-based One-Side Sampling |
+
+> 분기 방향은 결정론적(DGCS)으로 생성됩니다 — 유효 트리 하이퍼파라미터는
+> `max_depth`와 `reg_lambda`뿐입니다. 기존 확률적 풀 인자
+> (`inherited_rp_ratio`, `mutation_rate`, `mutation_strength`, `pobs`)는 제거되었습니다.
 
 ---
 

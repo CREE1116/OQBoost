@@ -79,41 +79,9 @@ struct OQBoostCtx {
   std::vector<int> cat_card;       // per cat col: n_distinct + 1 (NaN slot)
   std::vector<int32_t> cat_dense;  // N·D_cat dense ids (NaN → card-1)
 
-  // Persistent direction cache
-  static constexpr int DIR_CACHE_MAX = 32;
-  std::vector<std::vector<float>> dir_cache;  // dense D each
-  int dir_cache_next = 0;
-
   // Workspaces for oblique search (pre-allocated to avoid frequent malloc)
   std::vector<float> Xe_workspace; // Size: ne * D
   std::vector<float> Pj_workspace; // Size: n_dirs * ne
-
-  void cache_direction(const std::vector<float>& w) {
-    // Cache only the NUMERIC subspace of a winning direction. Categorical dims
-    // are per-round gradient-rank encoded, so a cat weight means something
-    // different in the next tree — but the numeric geometry is stable across
-    // trees. Projecting cat dims out (instead of skipping any cat-touching
-    // direction entirely) lets categorical-heavy datasets like adult still
-    // reuse cross-tree numeric directions — the cache was empty for them before.
-    float nw = 0.0f;
-    for (int d = 0; d < D_num; d++) nw += w[d] * w[d];
-    if (nw < 1e-12f) return;  // purely categorical direction — nothing stable
-    float norm = std::sqrt(nw);
-    float inv_norm = 1.0f / norm;
-    std::vector<float> wn(D, 0.0f);
-    for (int d = 0; d < D_num; d++) wn[d] = w[d] * inv_norm;  // cat dims stay 0
-    for (const auto& c : dir_cache) {
-      float dot = 0.0f;
-      for (int d = 0; d < D_num; d++) dot += c[d] * wn[d];
-      if (std::abs(dot) > 0.95f) return;  // redundant (both unit on numeric)
-    }
-    if ((int)dir_cache.size() < DIR_CACHE_MAX) {
-      dir_cache.push_back(std::move(wn));
-    } else {
-      dir_cache[dir_cache_next] = std::move(wn);
-      dir_cache_next = (dir_cache_next + 1) % DIR_CACHE_MAX;
-    }
-  }
 
   // ── Oblique scratch buffers (pre-allocated per context) ───────────────────
   // Flat direction matrix: dirs_buf[i*D + d] = component d of direction i.
@@ -404,22 +372,57 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
   tree->na_means.assign(D, 0.0f);
   std::copy(ctx->col_mean.begin(), ctx->col_mean.end(), tree->na_means.begin());
 
+  // Dominant class (largest gradient mass) — shared by categorical re-encoding
+  // and numeric-missing embedding below.
+  int kdom = 0;
+  {
+    float best_mass = -1.0f;
+    for (int c = 0; c < K; c++) {
+      float mcl = 0.0f;
+      for (int si = 0; si < Ns; si++)
+        mcl += std::abs(G[(size_t)sub[si] * K + c]);
+      if (mcl > best_mass) {
+        best_mass = mcl;
+        kdom = c;
+      }
+    }
+  }
+
+  // ── per-round numeric-missing embedding ──────────────────────────────────
+  // Last piece of the unified framework: numeric NaN is embedded as its own
+  // gradient-adaptive Newton response r_miss = -G_miss/(H_miss+λ), exactly the
+  // same form as a category value (G_c/(H_c+λ)) and a cat-NaN. Replaces the
+  // static mean imputation, so a numeric column becomes an Observed/Missing
+  // 2-state feature whose missing-state signal enters DGCS via Cov(φ,g)
+  // (e.g. "income missing" correlating with default is now visible to the
+  // oblique direction). Recomputed every round. Axis split keeps its NaN bin +
+  // default-direction; only the oblique embed value (Ximp / na_means) changes.
+  for (int f = 0; f < D_num; f++) {
+    double Gm = 0.0, Hm = 0.0; int nm = 0;
+    for (int si = 0; si < Ns; si++) {
+      int i = sub[si];
+      if (ctx->is_nan[(size_t)i * D + f]) {
+        Gm += G[(size_t)i * K + kdom];
+        Hm += H[(size_t)i * K + kdom];
+        nm++;
+      }
+    }
+    if (nm == 0) continue;  // no missing in this column
+    // Same Newton-response form as a category (sign +, no leaf-weight minus):
+    // the oblique weight vector w absorbs direction, and the search score is
+    // squared/abs, so the sign is redundant — dropping it makes numeric-missing
+    // and categorical embeddings perfectly symmetric.
+    float r_miss = (float)(Gm / (Hm + reg_lambda + EPS));
+    float* GF_RESTRICT Xw = ctx->Ximp.data();
+    for (int i = 0; i < N; i++) {
+      if (ctx->is_nan[(size_t)i * D + f]) Xw[(size_t)i * D + f] = r_miss;
+    }
+    tree->na_means[f] = r_miss;  // oblique routing uses this for NaN
+  }
+
   // ── per-round categorical re-encoding ────────────────────────────────────
   if (D_cat > 0) {
     tree->cat_ranks.assign(D_cat, {});
-    int kdom = 0;
-    {
-      float best_mass = -1.0f;
-      for (int c = 0; c < K; c++) {
-        float mcl = 0.0f;
-        for (int si = 0; si < Ns; si++)
-          mcl += std::abs(G[(size_t)sub[si] * K + c]);
-        if (mcl > best_mass) {
-          best_mass = mcl;
-          kdom = c;
-        }
-      }
-    }
     for (int fc = 0; fc < D_cat; fc++) {
       int f = D_num + fc;
       int card = ctx->cat_card[fc];
@@ -434,17 +437,36 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         Gs[id] += G[(size_t)i * K + kdom];
         Hs[id] += H[(size_t)i * K + kdom];
       }
+      // Newton gradient-response score per category: score(c) ≈ E[g|c]
+      // (regularized). This IS the unified DGCS embedding φ_j(c) = E[g|c] —
+      // node- and round-adaptive (recomputed every tree as gradients change),
+      // unlike CatBoost's static E[y|c] target encoding.
+      // (Confidence scaling ·√(n_c/N) was tested and lost on adult/MNAR: these
+      // have low-cardinality cats with ample samples, so it only damps signal.
+      // Revisit for high-cardinality datasets with rare categories.)
       std::vector<float> score(card);
       for (int id = 0; id < card; id++)
         score[id] = (float)(Gs[id] / (Hs[id] + reg_lambda + EPS));
-      std::vector<int> ord(card);
-      std::iota(ord.begin(), ord.end(), 0);
-      std::sort(ord.begin(), ord.end(), [&](int a, int b) {
-        if (score[a] != score[b]) return score[a] < score[b];
-        return a < b;
-      });
-      std::vector<float> rank_of(card);
-      for (int r = 0; r < card; r++) rank_of[ord[r]] = (float)r;
+
+      // Embed by the score MAGNITUDE (method A), affine-mapped to [0, card-1].
+      // Monotone in score, so axis bins/thresholds stay rank-compatible, but
+      // the oblique projection now sees the gradient-response *magnitude*
+      // (category spacing), not just the order — Cov(φ_j(x), g) becomes
+      // meaningful for categoricals, the whole point of unified DGCS.
+      float smin = 1e30f, smax = -1e30f;
+      for (int id = 0; id < card; id++) {
+        if (score[id] < smin) smin = score[id];
+        if (score[id] > smax) smax = score[id];
+      }
+      float srange = smax - smin;
+      std::vector<float> embed_of(card);
+      if (srange > 1e-12f) {
+        float sc = (float)(card - 1) / srange;
+        for (int id = 0; id < card; id++)
+          embed_of[id] = (score[id] - smin) * sc;
+      } else {
+        std::fill(embed_of.begin(), embed_of.end(), 0.0f);
+      }
 
       ctx->ax_min[f] = 0.0f;
       ctx->ax_range[f] = (float)(card - 1);
@@ -456,16 +478,17 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
 #pragma omp parallel for schedule(static)
 #endif
       for (int i = 0; i < N; i++) {
-        float r = rank_of[cd[(size_t)i * D_cat + fc]];
+        float r = embed_of[cd[(size_t)i * D_cat + fc]];
         Xw[(size_t)i * D + f] = r;
         int b = (int)(r * scale);
+        if (b < 0) b = 0;
         if (b >= AX_BINS) b = AX_BINS - 1;
         cw[(size_t)i * D + f] = (uint8_t)b;
       }
       auto& rk = tree->cat_ranks[fc];
       rk.reserve(ctx->cat_id[fc].size() * 2);
-      for (const auto& kv : ctx->cat_id[fc]) rk[kv.first] = rank_of[kv.second];
-      tree->na_means[f] = rank_of[card - 1];
+      for (const auto& kv : ctx->cat_id[fc]) rk[kv.first] = embed_of[kv.second];
+      tree->na_means[f] = embed_of[card - 1];
     }
   }
   const uint8_t* GF_RESTRICT code = ctx->code.data();
@@ -1144,30 +1167,13 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
           emit_dir(cgc, 4, false, 'c');  // per-class top-4 sparse
         }
       }
+
     }
 
-    // Direction cache (deterministic cross-tree memory, NOT random search):
-    // directions that won a split in EARLIER trees are replayed as candidates
-    // here. The per-node DGCS direction is the local gradient-covariance
-    // optimum; the cache adds globally-proven oblique directions the current
-    // node's gradient may not point at yet. dir_cache is filled in the growth
-    // loop (numeric-only; cache_direction skips cat dims).
-    //
-    // Gated to large nodes only (ns >= CACHE_MIN): on small nodes the local
-    // gradient already determines a good direction, and replaying cross-tree
-    // directions there overfits (breast-cancer 426-row: 0.972 → 0.951). On
-    // large nodes the cache recovers the gain that the removed random pool used
-    // to provide (adult numeric: 0.900 → 0.920, matching the old GG-SRP pool).
-    static constexpr int CACHE_MIN = 512;
-    if (ns >= CACHE_MIN) {
-      for (const auto& cw : ctx->dir_cache) {
-        if (dirs_n >= OQBoostCtx::DIRS_MAX) break;
-        std::memcpy(dirs_flat + (size_t)dirs_n * D, cw.data(),
-                    (size_t)D * sizeof(float));
-        dirs_n++;
-        if (gain_log) fam.push_back('k');
-      }
-    }
+    // (Direction cache removed: the gain-weighted blend below already does the
+    // variance reduction the cache was for, and an A/B with blend present showed
+    // the cache adds nothing — adult 0.9263 with / 0.9262 without. Dropping it
+    // cuts per-node candidates from ~36 to 4, much lighter.)
 
     float ob_gain = 0.0f, ob_thr = 0.0f;
     int ob_idx = -1;
@@ -1323,6 +1329,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       }
     }
     if (ob_idx < 0) return cand_gain[t];
+
     SparseVec sv;
 
     collect_nonzero_stack(dirs_flat + (size_t)ob_idx * D, D, sv);
@@ -1485,8 +1492,6 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     int tl = 2 * t_node + 1, tr_node = 2 * t_node + 2;
     int depth_t = get_node_depth(t_node);
 
-    // --- Split Refinement Step (Removed for Optimized Joint Scan in eval_axis) ---
-    if (cand_axis[t_node] < 0) ctx->cache_direction(cand_w[t_node]);
     tree->is_leaf[t_node] = 0;
     tree->split_threshold[t_node] = cand_thr[t_node];
     tree->split_gain[t_node] = cand_gain[t_node];

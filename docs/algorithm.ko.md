@@ -1,168 +1,166 @@
-# OQBoost: 알고리즘 및 이론 (Algorithm and Theory)
+# OQBoost: 알고리즘과 이론
 
-OQBoost는 높은 분류 정확도, 강력한 일반화 성능, C++ 기반의 빠른 실행 속도를 위해 설계된 정형 데이터용 경사 부스팅 사선 결정 트리(oblique GBDT) 모델입니다. 본 문서는 최근의 C++ 엔진 최적화를 포함하여 OQBoost의 수리적 설계와 아키텍처적 설계를 명세합니다.
+OQBoost는 그래디언트 부스팅 기반 **사선(oblique)** 결정 트리 앙상블이다. 핵심은
+분할 방향을 생성하는 단일하고 완전히 결정론적인 원리 — **결정론적 그래디언트
+공분산 스캔(DGCS, Deterministic Gradient Covariance Scan)** — 이며, 이 아래에서
+연속형·범주형·결측치가 모두 하나의 공분산 프레임워크로 처리된다.
 
----
-
-## 1. 뉴턴-랩슨 부스팅 프레임워크 (Newton-Raphson Boosting Framework)
-
-OQBoost는 표준적인 뉴턴-랩슨 부스팅 공식을 따릅니다. 라운드(반복) $m$에서 기존 앙상블 모델의 예측을 $F^{(m)}(x)$라 할 때, 다음 트리 $f^{(m+1)}(x)$는 손실 함수의 2차 테일러 전개식을 최소화하도록 학습됩니다.
-
-$$\mathcal{L}^{(m+1)} \approx \sum_{i=1}^{N} \left[ g_i f^{(m+1)}(x_i) + \frac{1}{2} h_i \left(f^{(m+1)}(x_i)\right)^2 \right] + \Omega(f^{(m+1)})$$
-
-여기서 변수들의 수리적 정의는 다음과 같습니다.
-*   $g_i = \left. \frac{\partial \ell(y_i, F(x_i))}{\partial F(x_i)} \right|_{F = F^{(m)}}$ 은 1차 경사(1st-order gradient)입니다.
-*   $h_i = \left. \frac{\partial^2 \ell(y_i, F(x_i))}{\partial F(x_i)^2} \right|_{F = F^{(m)}}$ 은 2차 헤시안(2nd-order Hessian)입니다.
-*   $\Omega(f) = \lambda \sum_{\text{leaves}} \|w_\text{leaf}\|^2$ 은 리프 노드 가중치에 대한 L2 정규화 페널티입니다.
-
-$K$-클래스 분류 문제의 경우, 앙상블은 K개의 출력 헤드를 갖고 다중 클래스 Softmax 손실 함수를 사용합니다.
+이 문서는 현재 엔진을 설명한다. (이전 버전은 확률적 후보 토너먼트 — GG-SRP 랜덤
+투영, 부모 방향 뮤테이션, 방향 캐시 — 를 사용했다. 이들은 DGCS로 대체되었다. §7
+참조.)
 
 ---
 
-## 2. 분할 전략: 사선 결정 규칙 (Oblique Decision Rules)
+## 1. Newton-Raphson 부스팅 프레임워크
 
-단일 피처만을 비교하여 축 정렬 방식으로 분기하는 기존 트리($x_j < \theta$)와 달리, OQBoost는 각 분기 노드에서 여러 피처의 선형 결합을 바탕으로 하는 **사선 분기(Oblique splits)**를 수행합니다.
+라운드 $m$의 앙상블 예측 $F^{(m)}(x)$가 주어지면, 다음 트리는 손실의 2차 테일러
+전개를 최소화한다:
 
-$$w^T x = \sum_{j \in \mathcal{S}} w_j x_j < \theta$$
+$$\mathcal{L}^{(m+1)} \approx \sum_{i=1}^{N} \left[ g_i f(x_i) + \tfrac{1}{2} h_i f(x_i)^2 \right] + \tfrac{1}{2}\lambda \sum_{\text{leaves}} w_\text{leaf}^2$$
 
-여기서 $w$는 희소 가중치 벡터(활성 피처 서브공간의 크기를 $|\mathcal{S}| \le D_{\text{SUB_MAX}} = 16$으로 엄격히 제한)이며, $\theta$는 분기 임계값입니다. 이를 통해 모델은 개별 노드 레벨에서 다차원 피처 간의 선형 상관 관계를 직접 캡처할 수 있습니다.
-
----
-
-## 3. 방향 벡터 생성 및 최적화 파이프라인 (Direction Generation & Optimization)
-
-OQBoost는 각 노드 분기 시점에서 값비싼 좌표 하강법(Coordinate Descent)이나 그람 행렬(Gram matrix)의 역행렬 연산을 피하기 위해, 경사(gradient) 정렬 정보를 담은 3단계 무작위화 파이프라인을 운영합니다.
-
-### 1단계: GG-SRP (그라디언트 유도형 희소 무작위 사영)
-모든 차원을 무차별로 탐색하는 대신, OQBoost는 현재 노드에 도달한 샘플 서브셋 $\mathcal{I}_t$를 기반으로 Sure Independence Screening (SIS) 스코어를 계산하여 피처 후보군을 추려냅니다.
-
-$$s_f = \frac{\left| \sum_{i \in \mathcal{I}_t} x_{if} g_i \right|}{\sqrt{\sum_{i \in \mathcal{I}_t} h_i x_{if}^2 + \lambda}}$$
-
-1.  **서브공간 선택**: 스크리닝 스코어 $s_f$에 비례하는 확률로 무작위 희소 서브공간 $\mathcal{S}$를 샘플링합니다.
-2.  **활성 피처 개수 한도**: C++ `SparseVec` 메모리 한계를 초과하지 않도록 0이 아닌 값을 가지는 피처 수를 $D_{\text{SUB_MAX}} = 16$으로 고정 캡핑합니다.
-3.  **부호 정렬**: 선택된 각 피처 $f \in \mathcal{S}$에 대해, 가중치 부호가 오차가 줄어드는 가파른 경사하강 방향과 일치하도록 결정합니다.
-    $$w_f = -\operatorname{sign}\left( \sum_{i \in \mathcal{I}_t} x_{if} g_i \right) \cdot |r_f|, \quad r_f \sim \mathcal{N}(0, 1)$$
-4.  **정규화**: 가중치 벡터의 L2 노름을 1로 정규화합니다: $w \leftarrow \frac{w}{\|w\|_2}$.
-
-### 2단계: 유전적 방향성 상속 (Hereditary Direction Inheritance)
-자식 노드에 도달한 샘플들은 이미 부모 노드의 분기 평면에 의해 걸러진 상태입니다. 따라서 부모 노드의 가중치 벡터 $w_{\text{parent}}$는 매우 훌륭한 초기 상태(warm-start) 역할을 합니다. OQBoost는 다음 두 가지 변이 전략을 검토합니다.
-*   **Strategy A (축 유지 변이)**: 부모의 결정 경계 축을 유지하면서 방향만 미세하게 조절합니다.
-    $$w_{\text{mutated}} = w_{\text{parent}} + \text{rate} \cdot \epsilon, \quad \epsilon_j \sim \mathcal{U}(-1, 1)$$
-*   **Strategy B (새로운 축 차용 변이)**: 부모의 피처 세트에 현 노드 오차와 상관성이 높은 새로운 피처 $f^*$ 하나를 확장 추가합니다.
-    $$w_{\text{mutated}} = w_{\text{parent}} \oplus \{ f^* \mapsto \pm \text{strength} \}$$
-
-### 3단계: 부모-캐시 크로스오버 및 깊이별 변이 감쇠 (Crossover & Depth-Decayed Mutation)
-*   **Strategy C (글로벌-로컬 크로스오버)**: 이전 부스팅 라운드에서 우수한 게인을 기록했던 최적의 방향 벡터들을 링 버퍼 형태의 글로벌 캐시 `dir_cache` (최대 32개)에 보관하고, 이를 부모의 방향과 블렌딩하여 후보로 만듭니다.
-    $$w_{\text{blend}} = \alpha w_{\text{parent}} + (1 - \alpha) w_{\text{cache}}, \quad \alpha \sim \mathcal{U}(0, 1)$$
-*   **깊이별 변이 감쇠**: 트리가 얕은 노드에서는 탐색(Exploration)이 유익하지만, 트리가 깊어질수록 샘플 크기가 급감하여 큰 변이는 과적합(Overfitting)을 유발합니다. OQBoost는 깊이 $d$에 반비례하여 변이율과 변이 강도를 감쇠시킵니다.
-    $$\text{rate}_d = \frac{\text{rate}_0}{\sqrt{1 + d}}, \quad \text{strength}_d = \frac{\text{strength}_0}{1 + d}$$
-*   **난수 시드 전파**: 트리의 다양성을 보장하고 부스팅 라운드 간 중복 분할을 방지하기 위해, 파이썬 분류기는 매 트리 빌드 시 고유한 난수 시드(예: `rng.integers(1 << 30)`)를 C++ 엔진에 전달합니다. C++ 엔진은 노드별 생성기 시드를 `seed + t`로 결합하여 전체 프로세스의 재현성과 다양성을 동시에 확보합니다.
+* $g_i$ — 1차 그래디언트, $h_i$ — 2차 헤시안 (둘 다 $F^{(m)}$에서).
+* 리프 값(Newton step): $w_\text{leaf} = -\dfrac{\sum_i g_i}{\sum_i h_i + \lambda}$.
+* $K$-클래스 분류는 softmax 손실 하에 $K$개 출력 헤드를 유지.
 
 ---
 
-## 4. 작동 원리: 수학적 및 통계학적 직관 (Why It Works)
+## 2. 사선 분할
 
-OQBoost가 기존 축 정렬 모델보다 우수한 성능을 내면서 동시에 무거운 경사 부스팅 트리의 학습 병목을 해결할 수 있었던 이유에는 다음과 같은 수학적 및 통계학적 배경이 있습니다.
+각 내부 노드는 단일 feature가 아니라 feature들의 선형결합으로 분할한다:
 
-### 4.1 오차의 최속 강하 방향 정렬 (Newton-Raphson Gradient Alignment)
-GG-SRP 기작의 핵심은 사영 방향을 단순한 무작위 탐색에 방임하지 않고, 노드에 도달한 샘플들의 경사(gradient) 분포의 반대 방향으로 피처별 가중치의 부호를 명시적으로 부합시키는 것입니다 ($w_f \propto -\operatorname{sign}(\sum g_i x_{if})$).
-수리적으로 이는 목적함수인 2차 Taylor 전개식(Newton step)의 최속 하강 방향(gradient descent path)과 초기 사영 축을 정렬시키는 동작으로, 이로 인해 탐색 풀 내부의 임의의 단일 사선 벡터조차 목적함수의 게인을 효율적으로 캡처하도록 보장됩니다.
+$$\sum_{j \in \mathcal{S}} w_j\,\phi_j(x) < \theta$$
 
-### 4.2 오목 탐색 공간의 극값 정리 (Extreme Values of Gain Distribution)
-노드 레벨의 후보 토너먼트 선택식은 최댓값 스캔 연산($G^* = \max_i \text{gain}(w_i)$)이므로 극값 통계학(Order Statistics) 법칙을 따릅니다.
-각 후보 생성 기작(Axis, SRP, 상속, 캐시)은 상호 독립적이거나 다른 꼬리 분포(tail shape)를 가지므로, 이들을 하이브리드하여 풀에 섞어주면 토너먼트 최대 게인의 기대치 최댓값($\mathbb{E}[\max]$)은 수학적으로 단일 패밀리만 구성할 때보다 항상 커지게 됩니다. 이것이 순수 무작위 사영이나 순수 상속 모델이 하이브리드 프로덕션 구성을 이기지 못한 수학적 배경입니다.
-
-### 4.3 직교 보완성 원리 (Orthogonality Principle & POBS)
-특정 노드에서 결정 경계 $w$에 의해 데이터 공간이 쪼개지면, 그라디언트 신호의 $w$ 방향 선형 성분은 자식 노드에서 대부분 소진됩니다. 따라서 자식 노드로 물려받은 오차의 정보(Residuals)는 부모 분할 평면의 직교 여공간(orthogonal complement) 영역으로 강하게 편향되어 농축됩니다.
-- OQBoost는 상호 직교하는 다차원 후보군 블록을 강제하는 **POBS (Parseval-Constrained Random Orthogonal Block Projections)** 기작을 통해 중복 검색 차원을 완벽히 소거하여, 한정된 토너먼트 풀 크기 안에서 탐색 공간의 다양성(diversity)을 극대화합니다. 이는 파르스발 항등식(Parseval's identity)에 근거하여 사영 에너지 총합을 보존하고, 토너먼트 내의 최댓값 하한선을 보장하는 수학적 안전장치 역할을 합니다.
-
-### 4.4 데이터 스케일별 추정치 분산 제어 (Bias-Variance trade-off via Depth-Adaptive Budget)
-트리 깊이가 깊어질수록 분기 노드에 유입되는 샘플의 수 $N_t$는 지수적으로 급감합니다.
-- **깊은 노드의 노이즈**: 적은 샘플 환경에서 복잡한 최적화(예: CD 또는 WLS 역행렬 계산)로 유도한 정밀 사선 축은 국소 샘플 노이즈에 완벽히 오버핏되어 모델 분산(variance)을 심각하게 폭증시킵니다.
-- **적응형 예산 분배**: OQBoost는 표본이 많아 시그널이 깨끗한 얕은 노드에는 64개 이상의 조밀한 토너먼트를 개최하고, 잡음이 심한 깊은 노드에는 후보군 크기를 8개 수준으로 대폭 조여 탐색을 제어합니다. 이는 학습 연산 속도를 대폭 단축함과 동시에 깊은 노드의 분기 분산을 억제하는 자동 정규화(regularization) 장치로 작동합니다.
+희소 가중치 벡터 $w$ ($|\mathcal{S}| \le D_\text{SUB\_MAX}=16$)와 임계값 $\theta$.
+$\phi_j$는 §4의 **통합 feature 임베딩**. 사선 경계는 축정렬 트리가 계단으로만
+근사할 수 있는 회전/상관 구조를 직접 포착한다.
 
 ---
 
-## 5. 메모리 최적화 C++ 엔진 (Memory-Optimized C++ Engine)
+## 3. DGCS — 결정론적 그래디언트 공분산 스캔
 
-### 객체 풀 기반 히스토그램 재사용 기법 (`hist_pool`)
-히스토그램 생성은 GBDT 학습 연산에서 가장 많은 시간을 소모하는 병목입니다. 최적 우선(Best-first) 트리 성장 과정에서 잦은 힙 메모리 할당(`malloc`) 및 해제(`free`)를 막기 위해, OQBoost는 `gf_build` 함수 내에 히스토그램 버퍼 풀을 구축하여 재활용합니다.
+노드의 핵심 질문: *어떤 방향 $w$가 그래디언트를 가장 잘 분리하는가?* 2차 분할
+이득 프록시는
 
-```cpp
-std::vector<std::vector<float>> hist_pool;
+$$J(w) = \frac{(w^\top G)^2}{w^\top H w + \lambda\lVert w\rVert^2}, \qquad G_j = \textstyle\sum_{i} \phi_j(x_i)\, g_{ik}$$
 
-auto get_hist = [&]() -> std::vector<float> {
-  if (!hist_pool.empty()) {
-    auto h = std::move(hist_pool.back());
-    hist_pool.pop_back();
-    std::fill(h.begin(), h.end(), 0.0f);
-    return h;
-  }
-  return std::vector<float>(HSZ, 0.0f);
-};
+여기서 $G$는 **그래디언트–feature 공분산**, $k$는 지배 클래스. DGCS는 최대값을
+탐색하지 않고 닫힌 형태로 직접 구한다.
 
-auto recycle_hist = [&](std::vector<float>& h) {
-  if (h.size() == HSZ) {
-    hist_pool.push_back(std::move(h));
-  }
-  h.clear();
-};
-```
+### 3.1 대각-Newton 방향
 
-이 객체 풀은 256-bin 피처 히스토그램 버퍼를 재사용하여, 풀이 일정 수준 차오른 뒤에는 힙 메모리 재할당 오버헤드를 0으로 낮춥니다.
+$H$를 대각 $\operatorname{diag}(\sum_i h_i \phi_j^2) \equiv A_j$로 근사하면 최대값은
 
-### 동적 하이브리드 히스토그램 병렬화 (Dynamic OpenMP Parallelization)
-OQBoost는 CPU 스레드 수($T$)와 현재 피처 수($D$)의 관계에 따라 OpenMP 병렬화 전략을 유연하게 스위칭합니다.
+$$w^*_j \;\propto\; \frac{G_j}{A_j + \lambda}.$$
 
-1.  **피처 단위 병렬화 (피처 수 $D \ge T$ 일 때)**:
-    *   피처들을 $\lfloor D/T \rfloor$ 크기의 청크로 쪼개어 스레드별로 할당합니다.
-    *   각 스레드는 자신에게 할당된 글로벌 히스토그램의 특정 슬라이스 영역에 직접 히스토그램을 작성합니다.
-    *   스레드별 로컬 버퍼 할당 및 병합(Merge) 절차가 필요 없어지므로 캐시 연속성(cache-contiguous)이 유지되고 최적의 성능을 냅니다.
-2.  **샘플 단위 병렬화 (피처 수 $D < T$ 일 때)**:
-    *   피처 수가 너무 적을 때 피처 단위 병렬화를 사용하면 사용되지 않고 노는 CPU 코어들이 생깁니다.
-    *   이 경우 샘플들을 스레드별로 할당하여 연산한 뒤, 병렬 리덕션(reduction) 루프로 머지합니다.
-    *   피처 수가 적기 때문에 로컬 버퍼가 L1/L2 캐시 공간에 완전히 담겨 캐시 경합(cache thrashing)이 방지됩니다.
+feature별 Newton 반응값이다. 대각 형태는 **스케일 불변**이다: $H\approx\sigma I$
+형태($w \propto G$)는 큰 스케일의 원시 feature(예: $10^5$ 스케일 feature가 공분산을
+지배)에 휘둘려 비정규화 데이터에서 사선 이득이 붕괴한다. $A_j$로 나누면 제거된다.
+정확한 WLS 해 $w = A^{-1}G$는 테스트 후 기각 — 작은 노드의 노이즈 헤시안에
+과적합하며, 대각 형태가 암묵적 정규화로 작동한다.
+
+### 3.2 희소 변형
+
+DGCS는 상위 $d_\text{sub}$개 feature(SIS 점수 $s_j = |G_j|/\sqrt{A_j+\lambda}$로
+순위)에서 작은 고정 결정론적 후보 집합을 생성한다:
+
+| 후보 | 설명 |
+| :-- | :-- |
+| `full`  | 상위 feature 전체의 대각-Newton 방향 |
+| `sign`  | $\pm1$ 그래디언트 부호 패턴 (스케일 무관) |
+| `top2`  | 희소: 가장 강한 2개 feature |
+| `top4`  | 희소: 가장 강한 4개 feature |
+
+멀티클래스에서는 클래스별로 공분산 방향을 하나씩 생성
+($G^{(c)}_j = \sum_i \phi_j x_i\, g_{ic}$)해, 지배 클래스만이 아니라 각 클래스의
+그래디언트 기하를 표현한다.
+
+### 3.3 완전 결정론적
+
+후보 생성에 RNG가 전혀 없다. 같은 데이터·그래디언트면 항상 같은 방향이 생성된다 —
+재현 가능하며, 기존 확률적 풀이 필요로 하던 하이퍼파라미터를 제거한다. 유효
+하이퍼파라미터는 `max_depth`와 `reg_lambda` 둘뿐이다.
 
 ---
 
-## 6. 알고리즘 시간 복잡도 (Complexity)
+## 4. 통합 Feature 프레임워크
+
+모든 feature 타입이 단일 임베딩 $\phi_j$로 매핑되고, 이후 DGCS는
+$\operatorname{Cov}(\phi_j, g)$만 본다 — 타입을 구분하지 못한다:
+
+| 타입 | 임베딩 $\phi_j(v)$ |
+| :-- | :-- |
+| 연속형 | $\phi = v$ |
+| 범주형 | $\phi(c) = \dfrac{G_c}{H_c+\lambda}$ — 그래디언트-순위 Newton 반응, **매 라운드** 재계산 |
+| 범주형 결측 | $\phi(\text{NaN}) = \dfrac{G_\text{miss}}{H_\text{miss}+\lambda}$ — 별도 범주 |
+| 수치형 결측 | $\phi(\text{NaN}) = \dfrac{G_\text{miss}}{H_\text{miss}+\lambda}$ — 동일 Newton 반응 형태 |
+
+범주 값은 노드 적응적 그래디언트 반응값과 같은 연속 좌표가 된다. CatBoost의 정적
+타깃 인코딩 $E[y\mid c]$와 달리 이것은 $E[g\mid c]$ — 매 라운드 **현재 부스팅
+잔차**에 적응한다. 수치형 결측은 동일한 Newton-반응 임베딩을 가진 "관측/결측" 추가
+상태로 취급되어, 결측 자체가 그래디언트와 상관될 때 그 신호가 공분산
+($\operatorname{Cov}(\text{결측}, g)$)에 들어간다. 결과적으로 연속형·범주형·결측이
+하나의 공분산 파이프라인을 흐른다.
+
+---
+
+## 5. 노드 탐색과 트리 성장
+
+각 노드에서 OQBoost는 두 후보 패밀리를 평가하고 이득 최대를 선택한다:
+
+1. **축 스캔** — 모든 feature에 대한 전체 히스토그램 스캔(256 빈), 표준
+   XGBoost/LightGBM식 분할. 학습된 기본 방향을 가진 결측 빈 포함(NaN을 이득
+   기준으로 좌/우 전송). 히스토그램 뺄셈(자식 = 부모 − 형제) 덕에 거의 공짜이며,
+   범주형 분할에서 사선 경로보다 정밀하다.
+2. **사선 DGCS** — §3의 결정론적 공분산 방향. 연속 샘플 패널에서 배치(BLAS GEMM)
+   투영으로 평가.
+
+성장은 **지연 best-first**: 우선순위 큐가 잠재 이득 최대 노드를 먼저 확장(리프
+예산 하). 리프 값은 부모-shrinkage 평활을 적용한 Newton step.
+
+---
+
+## 6. 메모리 최적화 C++ 엔진
+
+* **히스토그램 객체 풀** — 256-빈 feature 히스토그램을 best-first 성장 전반에
+  재활용, 정상 상태에서 힙 할당을 0으로.
+* **히스토그램 뺄셈** — 작은 자식은 새로 계산, 큰 자식은 `부모 − 작은 자식`.
+* **동적 하이브리드 병렬화** — $D \ge T$이면 블록 단위 feature 병렬(병합 오버헤드
+  0, 캐시 연속), $D < T$이면 스레드-로컬 병합 샘플 병렬(작은 버퍼가 L1/L2 상주).
+* **배치 사선 투영** — 모든 후보 방향을 연속 패널에서 단일 BLAS GEMM으로 투영.
+* **K=2 고속 경로** — 이진/OVR 히스토그램 언롤(스트라이드 5).
+
+---
+
+## 7. DGCS가 확률적 풀을 대체한 이유
+
+이전 엔진은 랜덤 패밀리 토너먼트(GG-SRP 희소 랜덤 투영, 부모 방향 뮤테이션, 트리
+간 방향 캐시)로 방향을 생성했다. DGCS가 이들을 닫힌 형태 공분산 방향으로 대체한
+이유:
+
+* **최대값의 표본이 아니라 최대값 자체.** 확률적 풀은 많은 후보를 뽑아 최고를
+  골라 좋은 방향을 탐색했다. DGCS는 2차 최적 방향을 직접 유도한다. 탐색 없음, RNG
+  없음, 하이퍼파라미터 감소.
+* **운이 아니라 구조에 의한 분산 제어.** 공분산 추정은 작은 노드에서 노이즈가
+  크지만, 대각-Newton 정규화와 SIS feature 제한이 결정론적으로 정규화한다.
+* **모든 feature 타입을 위한 단일 프레임워크**(§4) — 랜덤 풀은 범주형/결측에 대해
+  제공할 수 없던 것.
+
+후보의 이득 가중 블렌드와 트리 간 방향 캐시를 분산 감소 추가 장치로 평가했으나,
+실제 표 형식 데이터에서 효과가 순수 DGCS의 노이즈 범위 내였으므로 엔진을 단순하고
+가볍게 유지하기 위해 제거했다.
+
+---
+
+## 8. 알고리즘 복잡도
 
 | 단계 | 시간 복잡도 | 비고 |
 | :--- | :--- | :--- |
-| **컨텍스트 생성 (Context)** | $O(N \cdot D)$ | 학습 초기 1회 수행, 피처의 bin 경계 계산 |
-| **범주형 피처 재인코딩** | $O(N \cdot D_{\text{cat}})$ | 매 부스팅 라운드별 1회 수행 |
-| **GG-SRP 사영 연산** | $O(D + b)$ | 노드별 수행; 서브공간 피처 수 $b \le 16$ |
-| **히스토그램 빌딩** | $O(n_t \cdot D \cdot 256)$ | 히스토그램 감산 기법 적용으로 실제 연산 범위 축소 |
-| **추론 시 샘플 라우팅** | $O(N \cdot \text{depth} \cdot s)$ | 분기당 사용 피처 수 평균 $s \le 6$ |
+| 컨텍스트 생성 | $O(N \cdot D)$ | 1회; 빈 임계값 + 임베딩 |
+| 범주형/결측 재인코딩 | $O(N \cdot D)$ | 라운드당 1회 (그래디언트 적응) |
+| DGCS 방향 | $O(n_t \cdot d_\text{sub})$ | 노드당; 공분산 + 대각 |
+| 히스토그램 구성 | $O(n_t \cdot D \cdot 256)$ | 히스토그램 뺄셈으로 감소 |
+| 추론 라우팅 | $O(N \cdot \text{depth} \cdot s)$ | 분할당 활성 feature $s \le 16$ |
 
 ---
 
-## 7. 소거 연구 및 실험 결과 (Empirical Findings)
-
-분류용 벤치마크 데이터(샘플 10만 개, 피처 50개)를 통한 소거 연구 결과는 다음과 같습니다.
-
-*   **GG-SRP vs 좌표 하강법(CD)**: 정확한 수치 최적화인 Gauss-Seidel CD 좌표 탐색 대신, 해석적이고 단순 확률 사영에 기초한 GG-SRP를 적용하여도 균형 정확도 손실 없이 노드 연산 속도를 **10배 이상** 단축했습니다.
-*   **부모 노드 상속 및 크로스오버**: 캐시 교차 탐색(Strategy C)과 깊이별 감쇠 변이를 조합 적용할 때 가장 낮고 안정적인 Log Loss를 달성하여 과적합을 효과적으로 통제했습니다.
-*   **균형화된 Argmax 의사결정**: 클래스 비율 불균형 시 강제로 Newton-Raphson 경사를 왜곡하는 대신, 최종 `predict` 시점에 사전 보정(prior correction) 비율을 조정함으로써 확률 추정값(log loss)을 훼손하지 않으면서도 균형 정확도를 높였습니다.
-*   **상속 기작의 실험적 통찰**: 인위적 데이터 실험을 통해 부모의 분할 기준을 그대로 물려받는 상계 변이가 국소 오차 소진(orthogonality principle)으로 인해 생각보다 비효율적임을 발견했습니다. 그럼에도 튜닝 파라미터 제약 하에서 고유 차원의 보완을 돕는 안전망 역할을 하고 있음을 실전 검증하였습니다. (`research/FINDINGS.md` 참고)
-
----
-
-## 8. 향후 연구 과제: 그라디언트 공분산 기반 사선 유도 (Gradient Covariance)
-
-2026-06-13, 프로토타입(`OQBoostCovClassifier`) 연구를 통해 사선 생성 파이프라인을 획기적으로 단순화하는 통계적 최적화 방향이 수립되었습니다.
-
-### 핵심 단순화 제안:
-노드 분기 마다 임의의 방향 벡터를 무수히 난립시켜 토너먼트를 여는 방식 대신, 다음 두 갈래로만 축을 좁혀 검토합니다.
-1. 기존 $D$개의 단일 피처 축 정렬 벡터 (회전되지 않은 원본 공간의 척도 보호용).
-2. 현 노드의 오차 기여도가 높은 피처들에 한정해 계산한 딱 **1개**의 그라디언트 공분산 벡터 $w_{\text{cov}}$:
-   $$w_{\text{cov_sub}} = \frac{G_{\text{sub}}}{\|G_{\text{sub}}\|_2 + \epsilon}, \quad \text{where } G_{\text{sub}} = -X_{\text{sub}}^T g$$
-
-이를 통해 탐색 후보 풀의 크기를 매 노드마다 $D+1$개로 제한할 수 있습니다.
-
-### 이론적 배경:
-데이터가 소실되는 깊은 노드에서 노이즈가 낀 헤시안 역행렬 계산($A^{-1}G$ 방식의 Newton-Raphson 해)에 집착하지 않고, 단순히 오차의 주류 경향(공분산)만을 따라 사선 축을 유도함으로써 Hessian-free 형태의 내재적 규제(Implicit L2 Regularization) 효과를 얻습니다. 실험실 수준의 tabular 벤치마크(Adult, Credit Default) 테스트에서 이 단순한 $D+1$ 설계는 좌표 하강법이나 종전의 대규모 토너먼트 방식보다 일관되게 높은 정확도 및 낮은 Log Loss를 나타냈습니다. 차기 엔진 릴리스에서 이 그라디언트 공분산 사선 유도 메커니즘을 C++ 코어에 포팅하는 방안이 유력하게 논의되고 있습니다.
-
----
-
-[English Version (영문 버전)](algorithm.md)
+[English Version](algorithm.md)
